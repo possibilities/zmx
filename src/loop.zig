@@ -955,7 +955,7 @@ pub const Daemon = struct {
         term: *ghostty_vt.Terminal,
         payload: []const u8,
     ) !void {
-        if (payload.len != @sizeOf(ipc.Resize)) return;
+        const size = ipc.decodeResize(payload) catch return;
 
         client.is_terminal = true;
 
@@ -963,7 +963,7 @@ pub const Daemon = struct {
             try self.setLeader(gpa, client);
         }
         const is_leader = self.leader_client_fd == client.socket_fd;
-        const resize = std.mem.bytesToValue(ipc.Resize, payload);
+        const resize = size;
 
         // Resize our terminal (not yet the PTY) to the leader's size before
         // serializing, so the snapshot is laid out for the width the client
@@ -1031,14 +1031,14 @@ pub const Daemon = struct {
         term: *ghostty_vt.Terminal,
         payload: []const u8,
     ) !void {
-        if (payload.len != @sizeOf(ipc.Resize)) return;
+        const size = ipc.decodeResize(payload) catch return;
         if (self.leader_client_fd == null) {
             try self.setLeader(gpa, client);
         }
         // only leader can resize
         if (self.leader_client_fd != client.socket_fd) return;
 
-        const resize = std.mem.bytesToValue(ipc.Resize, payload);
+        const resize = size;
         var ws = resize.winsize();
         _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
         try resizeTerm(gpa, term, resize.cols, resize.rows);
@@ -1155,8 +1155,7 @@ pub const Daemon = struct {
         term: *ghostty_vt.Terminal,
         payload: []const u8,
     ) !void {
-        if (payload.len != @sizeOf(ipc.Capture)) return;
-        const request = std.mem.bytesToValue(ipc.Capture, payload);
+        const request = ipc.decodeCapture(payload) catch return;
         const format = std.enums.fromInt(util.HistoryFormat, request.format) orelse return;
         self.setPwd(term);
         const output = util.serializeTerminalRange(gpa, term, format, request.rows);
@@ -1530,7 +1529,7 @@ test "handleEnvGet returns leader client's environment variables including unset
     try std.testing.expectEqual(@as(?i32, fds1[0]), daemon.leader_client_fd);
     try daemon.handleEnvGet(alloc, &client_req);
     // Wire message: [Header][Payload]
-    const pay1 = client_req.write_buf.items[@sizeOf(ipc.Header)..];
+    const pay1 = client_req.write_buf.items[ipc.header_len..];
     try std.testing.expectEqualStrings("DISPLAY=:1\nSSH_AUTH_SOCK=/tmp/ssh-1\nKITTY_LISTEN_ON=unix:/tmp/kitty-1\n-WINDOWID\n", pay1);
     client_req.write_buf.clearRetainingCapacity();
 
@@ -1538,13 +1537,13 @@ test "handleEnvGet returns leader client's environment variables including unset
     try daemon.setLeader(alloc, &client2);
     try std.testing.expectEqual(@as(?i32, fds2[0]), daemon.leader_client_fd);
     try daemon.handleEnvGet(alloc, &client_req);
-    const pay2 = client_req.write_buf.items[@sizeOf(ipc.Header)..];
+    const pay2 = client_req.write_buf.items[ipc.header_len..];
     try std.testing.expectEqualStrings("SSH_AUTH_SOCK=/tmp/ssh-2\nWINDOWID=12345\nKITTY_LISTEN_ON=unix:/tmp/kitty-2\n-DISPLAY\n", pay2);
     client_req.write_buf.clearRetainingCapacity();
 
     // Client2 updates env
     try daemon.handleEnvSet(alloc, &client2, "DISPLAY=:99\n");
     try daemon.handleEnvGet(alloc, &client_req);
-    const pay3 = client_req.write_buf.items[@sizeOf(ipc.Header)..];
+    const pay3 = client_req.write_buf.items[ipc.header_len..];
     try std.testing.expectEqualStrings("DISPLAY=:99\n", pay3);
 }

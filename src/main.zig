@@ -1476,11 +1476,8 @@ fn history(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []cons
 
     const reply_tag: ipc.Tag = if (scrollback_rows != null) .Capture else .History;
     if (scrollback_rows) |rows| {
-        // zeroes() so asBytes() doesn't ship packed struct padding.
-        var request = std.mem.zeroes(ipc.Capture);
-        request.format = @intFromEnum(format);
-        request.rows = rows;
-        ipc.send(fd, .Capture, std.mem.asBytes(&request)) catch |err| switch (err) {
+        const request = ipc.encodeCapture(.{ .format = @intFromEnum(format), .rows = rows });
+        ipc.send(fd, .Capture, &request) catch |err| switch (err) {
             error.BrokenPipe, error.ConnectionResetByPeer => return,
             else => return err,
         };
@@ -1931,7 +1928,7 @@ fn run(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, detached: bool, comm
     defer lib_posix.close(client_sock);
 
     const term_size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
-    ipc.send(client_sock, .Resize, std.mem.asBytes(&term_size)) catch {};
+    ipc.send(client_sock, .Resize, &ipc.encodeResize(term_size)) catch {};
 
     var fds = try std.ArrayList(i32).initCapacity(gpa, 1);
     defer fds.deinit(gpa);

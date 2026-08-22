@@ -41,12 +41,44 @@ comptime {
     );
 }
 
-pub const Header = packed struct {
+/// Frame envelope. On the wire it is exactly `header_len` bytes: the tag
+/// byte, the payload length as a u32 little-endian, then `header_reserved`
+/// zero bytes. Encoding is explicit (`encodeHeader`/`decodeHeader`) so the
+/// layout is a contract rather than whatever `packed struct` emits on the
+/// host; see the frozen-bytes tests below.
+pub const Header = struct {
     tag: Tag,
     len: u32,
 };
 
-pub const Resize = packed struct {
+pub const header_len = 8;
+const header_reserved = header_len - 1 - @sizeOf(u32);
+
+/// Largest payload a frame may carry. A header announcing more is a protocol
+/// violation: the reader fails instead of accumulating bytes toward it.
+/// Sized for one restoration snapshot (the largest frame either side sends
+/// today); make it configurable when scrollback becomes configurable.
+pub const max_payload_len: u32 = 16 * 1024 * 1024;
+
+pub fn encodeHeader(tag: Tag, len: u32) [header_len]u8 {
+    var out = [_]u8{0} ** header_len;
+    out[0] = @intFromEnum(tag);
+    std.mem.writeInt(u32, out[1..5], len, .little);
+    return out;
+}
+
+/// Reserved bytes are ignored on decode so a future revision can claim them
+/// without this reader rejecting the frame.
+pub fn decodeHeader(bytes: *const [header_len]u8) Header {
+    return .{
+        .tag = @enumFromInt(bytes[0]),
+        .len = std.mem.readInt(u32, bytes[1..5], .little),
+    };
+}
+
+/// Terminal size. On the wire: rows, cols, xpixel, ypixel, each a u16
+/// little-endian, `resize_len` bytes total.
+pub const Resize = struct {
     rows: u16,
     cols: u16,
     xpixel: u16 = 0,
@@ -60,10 +92,46 @@ pub const Resize = packed struct {
 /// Request payload for `Tag.Capture`. `format` is a `util.HistoryFormat`
 /// and `rows` is how many scrollback rows to include above the active
 /// screen; zero returns only the screen.
-pub const Capture = packed struct {
+pub const Capture = struct {
     format: u8,
     rows: u32,
 };
+
+/// Format byte, u32 little-endian rows, then three reserved zero bytes.
+pub const capture_len = 8;
+
+pub fn encodeCapture(request: Capture) [capture_len]u8 {
+    var out = [_]u8{0} ** capture_len;
+    out[0] = request.format;
+    std.mem.writeInt(u32, out[1..5], request.rows, .little);
+    return out;
+}
+
+pub fn decodeCapture(bytes: []const u8) error{BadLength}!Capture {
+    if (bytes.len != capture_len) return error.BadLength;
+    return .{ .format = bytes[0], .rows = std.mem.readInt(u32, bytes[1..5], .little) };
+}
+
+pub const resize_len = 8;
+
+pub fn encodeResize(size: Resize) [resize_len]u8 {
+    var out: [resize_len]u8 = undefined;
+    std.mem.writeInt(u16, out[0..2], size.rows, .little);
+    std.mem.writeInt(u16, out[2..4], size.cols, .little);
+    std.mem.writeInt(u16, out[4..6], size.xpixel, .little);
+    std.mem.writeInt(u16, out[6..8], size.ypixel, .little);
+    return out;
+}
+
+pub fn decodeResize(bytes: []const u8) error{BadLength}!Resize {
+    if (bytes.len != resize_len) return error.BadLength;
+    return .{
+        .rows = std.mem.readInt(u16, bytes[0..2], .little),
+        .cols = std.mem.readInt(u16, bytes[2..4], .little),
+        .xpixel = std.mem.readInt(u16, bytes[4..6], .little),
+        .ypixel = std.mem.readInt(u16, bytes[6..8], .little),
+    };
+}
 
 pub fn getTerminalSize(fd: i32) Resize {
     var ws: cross.c.struct_winsize = undefined;
@@ -105,20 +173,21 @@ pub const Info = extern struct {
 };
 
 pub fn expectedLength(data: []const u8) ?usize {
-    if (data.len < @sizeOf(Header)) return null;
-    const header = std.mem.bytesToValue(Header, data[0..@sizeOf(Header)]);
+    if (data.len < header_len) return null;
+    const header = decodeHeader(data[0..header_len]);
     // header.len comes off the wire; widen to usize before adding so a
     // near-u32-max value can't wrap (panic in safe mode, UB in release).
-    return @as(usize, @sizeOf(Header)) + @as(usize, header.len);
+    return @as(usize, header_len) + @as(usize, header.len);
+}
+
+fn payloadLen(data: []const u8) error{FrameTooLarge}!u32 {
+    if (data.len > max_payload_len) return error.FrameTooLarge;
+    return @intCast(data.len);
 }
 
 pub fn send(fd: i32, tag: Tag, data: []const u8) !void {
-    const header = Header{
-        .tag = tag,
-        .len = @intCast(data.len),
-    };
-    const header_bytes = std.mem.asBytes(&header);
-    try writeAll(fd, header_bytes);
+    const header_bytes = encodeHeader(tag, try payloadLen(data));
+    try writeAll(fd, &header_bytes);
     if (data.len > 0) {
         try writeAll(fd, data);
     }
@@ -130,14 +199,11 @@ pub fn appendMessage(
     tag: Tag,
     data: []const u8,
 ) !void {
-    const header = Header{
-        .tag = tag,
-        .len = @intCast(data.len),
-    };
+    const header_bytes = encodeHeader(tag, try payloadLen(data));
     // Guarantee capacity for header + payload in one check to avoid
     // intermediate realloc between the two appends on the hot path.
-    try list.ensureTotalCapacity(gpa, list.items.len + @sizeOf(Header) + data.len);
-    list.appendSliceAssumeCapacity(std.mem.asBytes(&header));
+    try list.ensureTotalCapacity(gpa, list.items.len + header_len + data.len);
+    list.appendSliceAssumeCapacity(&header_bytes);
     if (data.len > 0) {
         list.appendSliceAssumeCapacity(data);
     }
@@ -155,8 +221,8 @@ pub fn appendSizeMessage(
     tag: Tag,
     size: Resize,
 ) !void {
-    const bytes = std.mem.asBytes(&size);
-    try appendMessage(alloc, list, tag, bytes);
+    const bytes = encodeResize(size);
+    try appendMessage(alloc, list, tag, &bytes);
     try appendMessage(alloc, list, tag, bytes[0..LEGACY_RESIZE_LEN]);
 }
 
@@ -206,6 +272,8 @@ pub const SocketBuffer = struct {
     /// Returns number of bytes read.
     /// Propagates error.WouldBlock and other errors to caller.
     /// Returns 0 on EOF.
+    /// Returns error.FrameTooLarge once the pending frame's header announces
+    /// a payload over `max_payload_len`; the caller should drop the peer.
     pub fn read(self: *SocketBuffer, fd: i32) !usize {
         if (self.head > 0) {
             const remaining = self.buf.items.len - self.head;
@@ -222,8 +290,16 @@ pub const SocketBuffer = struct {
         const n = try lib_posix.read(fd, &tmp);
         if (n > 0) {
             try self.buf.appendSlice(self.alloc, tmp[0..n]);
+            try self.checkPendingFrame();
         }
         return n;
+    }
+
+    fn checkPendingFrame(self: *SocketBuffer) error{FrameTooLarge}!void {
+        const available = self.buf.items[self.head..];
+        if (available.len < header_len) return;
+        const header = decodeHeader(available[0..header_len]);
+        if (header.len > max_payload_len) return error.FrameTooLarge;
     }
 
     /// Returns the next complete message or `null` when none available.
@@ -234,8 +310,8 @@ pub const SocketBuffer = struct {
         const total = expectedLength(available) orelse return null;
         if (available.len < total) return null;
 
-        const hdr = std.mem.bytesToValue(Header, available[0..@sizeOf(Header)]);
-        const pay = available[@sizeOf(Header)..total];
+        const hdr = decodeHeader(available[0..header_len]);
+        const pay = available[header_len..total];
 
         self.head += total;
         return .{ .header = hdr, .payload = pay };
@@ -343,8 +419,10 @@ pub fn probeSession(
 //  Need to remove one? → don't. Reserve the integer, stop sending it.
 test "Info wire size is frozen" {
     try std.testing.expectEqual(@as(usize, 552), @sizeOf(Info));
-    // packed struct{u8,u32} backs to u40 → @sizeOf rounds to 8, not 5.
-    try std.testing.expectEqual(@as(usize, 8), @sizeOf(Header));
+    // The 8-byte envelope predates the explicit codec: packed struct{u8,u32}
+    // backed to u40 and @sizeOf rounded to 8, so the codec keeps 3 reserved
+    // zero bytes rather than shrinking the header.
+    try std.testing.expectEqual(@as(usize, 8), header_len);
 }
 
 // Measured with `std.mem.asBytes` on aarch64 and x86_64 little-endian in
@@ -353,17 +431,19 @@ test "Info wire size is frozen" {
 // four u16 little-endian fields. These bytes are the wire contract now, not
 // whatever `packed struct` happens to emit.
 test "Header wire bytes are frozen" {
-    const header = Header{ .tag = .Resize, .len = 0x01020304 };
     try std.testing.expectEqualSlices(
         u8,
         &.{ 0x02, 0x04, 0x03, 0x02, 0x01, 0x00, 0x00, 0x00 },
-        std.mem.asBytes(&header),
+        &encodeHeader(.Resize, 0x01020304),
     );
-    const decoded = std.mem.bytesToValue(Header, &[_]u8{ 0x01, 0x05, 0, 0, 0, 0, 0, 0 });
+    const decoded = decodeHeader(&.{ 0x01, 0x05, 0, 0, 0, 0, 0, 0 });
     try std.testing.expectEqual(Tag.Output, decoded.tag);
     try std.testing.expectEqual(@as(u32, 5), decoded.len);
+    // Reserved bytes are ignored on decode.
+    const padded = decodeHeader(&.{ 0x01, 0x05, 0, 0, 0, 0xde, 0xad, 0xbe });
+    try std.testing.expectEqual(@as(u32, 5), padded.len);
     // An integer outside the enum decodes to itself; `_` arms must handle it.
-    const unknown = std.mem.bytesToValue(Header, &[_]u8{ 200, 0, 0, 0, 0, 0, 0, 0 });
+    const unknown = decodeHeader(&.{ 200, 0, 0, 0, 0, 0, 0, 0 });
     try std.testing.expectEqual(@as(u8, 200), @intFromEnum(unknown.tag));
 }
 
@@ -372,13 +452,63 @@ test "Resize wire bytes are frozen" {
     try std.testing.expectEqualSlices(
         u8,
         &.{ 0x18, 0x00, 0x50, 0x00, 0x02, 0x01, 0x04, 0x03 },
-        std.mem.asBytes(&size),
+        &encodeResize(size),
     );
-    const decoded = std.mem.bytesToValue(Resize, &[_]u8{ 0x18, 0x00, 0x50, 0x00, 0x02, 0x01, 0x04, 0x03 });
-    try std.testing.expectEqual(@as(u16, 24), decoded.rows);
-    try std.testing.expectEqual(@as(u16, 80), decoded.cols);
-    try std.testing.expectEqual(@as(u16, 0x0102), decoded.xpixel);
-    try std.testing.expectEqual(@as(u16, 0x0304), decoded.ypixel);
+    const decoded = try decodeResize(&.{ 0x18, 0x00, 0x50, 0x00, 0x02, 0x01, 0x04, 0x03 });
+    try std.testing.expectEqual(size, decoded);
+    try std.testing.expectError(error.BadLength, decodeResize(&.{ 0x18, 0x00, 0x50 }));
+    try std.testing.expectError(error.BadLength, decodeResize(&([_]u8{0} ** 9)));
+}
+
+test "appendMessage frames a payload and SocketBuffer reassembles it" {
+    const alloc = std.testing.allocator;
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(alloc);
+    try appendMessage(alloc, &wire, .Output, "hello");
+    try appendMessage(alloc, &wire, .Detach, "");
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 0x01, 0x05, 0, 0, 0, 0, 0, 0, 'h', 'e', 'l', 'l', 'o', 0x03, 0, 0, 0, 0, 0, 0, 0 },
+        wire.items,
+    );
+
+    // Feed the bytes through the reader one byte at a time: frames must
+    // only surface once complete, and must survive any fragmentation.
+    var sb = try SocketBuffer.init(alloc);
+    defer sb.deinit();
+    var seen: usize = 0;
+    for (wire.items, 0..) |b, i| {
+        try sb.buf.append(alloc, b);
+        try sb.checkPendingFrame();
+        while (sb.next()) |msg| {
+            seen += 1;
+            if (seen == 1) {
+                try std.testing.expectEqual(Tag.Output, msg.header.tag);
+                try std.testing.expectEqualStrings("hello", msg.payload);
+                try std.testing.expectEqual(@as(usize, 12), i);
+            } else {
+                try std.testing.expectEqual(Tag.Detach, msg.header.tag);
+                try std.testing.expectEqual(@as(usize, 0), msg.payload.len);
+                try std.testing.expectEqual(@as(usize, 20), i);
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), seen);
+}
+
+test "oversized frame header is rejected before its payload arrives" {
+    const alloc = std.testing.allocator;
+    var sb = try SocketBuffer.init(alloc);
+    defer sb.deinit();
+    try sb.buf.appendSlice(alloc, &encodeHeader(.Output, max_payload_len));
+    try sb.checkPendingFrame();
+    sb.buf.clearRetainingCapacity();
+    try sb.buf.appendSlice(alloc, &encodeHeader(.Output, max_payload_len + 1));
+    try std.testing.expectError(error.FrameTooLarge, sb.checkPendingFrame());
+    // The encoder refuses to announce what the reader would reject.
+    var too_big: []const u8 = &.{};
+    too_big.len = max_payload_len + 1;
+    try std.testing.expectError(error.FrameTooLarge, payloadLen(too_big));
 }
 
 test "Tag wire values are frozen" {
@@ -433,20 +563,20 @@ test "appendSizeMessage emits current and legacy encodings" {
     const size = Resize{ .rows = 45, .cols = 170, .xpixel = 900, .ypixel = 1800 };
     try appendSizeMessage(alloc, &list, .Init, size);
 
-    const h1 = std.mem.bytesToValue(Header, list.items[0..@sizeOf(Header)]);
+    const h1 = decodeHeader(list.items[0..header_len]);
     try std.testing.expectEqual(Tag.Init, h1.tag);
-    try std.testing.expectEqual(@as(u32, @sizeOf(Resize)), h1.len);
-    const p1 = list.items[@sizeOf(Header)..][0..@sizeOf(Resize)];
-    try std.testing.expectEqual(size, std.mem.bytesToValue(Resize, p1));
+    try std.testing.expectEqual(@as(u32, resize_len), h1.len);
+    const p1 = list.items[header_len..][0..resize_len];
+    try std.testing.expectEqual(size, try decodeResize(p1));
 
-    const off2 = @sizeOf(Header) + @sizeOf(Resize);
-    const h2 = std.mem.bytesToValue(Header, list.items[off2..][0..@sizeOf(Header)]);
+    const off2 = header_len + resize_len;
+    const h2 = decodeHeader(list.items[off2..][0..header_len]);
     try std.testing.expectEqual(Tag.Init, h2.tag);
     try std.testing.expectEqual(@as(u32, LEGACY_RESIZE_LEN), h2.len);
     // Legacy payload is the rows+cols prefix of the current encoding.
-    const p2 = list.items[off2 + @sizeOf(Header) ..][0..LEGACY_RESIZE_LEN];
+    const p2 = list.items[off2 + header_len ..][0..LEGACY_RESIZE_LEN];
     try std.testing.expectEqualSlices(u8, p1[0..LEGACY_RESIZE_LEN], p2);
-    try std.testing.expectEqual(off2 + @sizeOf(Header) + LEGACY_RESIZE_LEN, list.items.len);
+    try std.testing.expectEqual(off2 + header_len + LEGACY_RESIZE_LEN, list.items.len);
 }
 
 test "zeroed Info has no stack garbage in wire bytes" {
