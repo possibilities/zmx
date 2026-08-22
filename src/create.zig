@@ -28,6 +28,9 @@ pub const Options = struct {
     /// Working directory for the child, as the caller sees it.
     cwd: []const u8,
     shell: []const u8,
+    /// Lines of scrollback the session keeps; null keeps the configured
+    /// default (`ZMX_SCROLLBACK_LINES`, else 2000).
+    scrollback_lines: ?usize = null,
 };
 
 /// Machine-readable failure names. Stable: fmx matches on them.
@@ -90,6 +93,8 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, opts: Options) !u8 
     // frees it here, after any report that names it has been written.
     var creator_owns_socket_path = true;
     defer if (creator_owns_socket_path) gpa.free(socket_path);
+
+    if (opts.scrollback_lines) |lines| cfg.max_scrollback_lines = lines;
 
     var daemon = Daemon.init(io, cfg, sesh, socket_path);
     daemon.command = opts.command;
@@ -228,6 +233,7 @@ pub const Args = struct {
     labels: ?[]const u8 = null,
     json: bool = false,
     timeout_ms: u32 = Daemon.default_startup_timeout_ms,
+    scrollback_lines: ?usize = null,
     want_help: bool = false,
     /// Set when a flag was malformed; the message says which.
     usage_error: ?[]const u8 = null,
@@ -268,6 +274,17 @@ pub fn parseArgs(argv: []const []const u8) Args {
             };
             continue;
         }
+        if (flagValue(argv, &i, "--scrollback-lines")) |v| {
+            const text = v orelse {
+                parsed.usage_error = "--scrollback-lines requires a number of lines";
+                return parsed;
+            };
+            parsed.scrollback_lines = std.fmt.parseInt(usize, text, 10) catch {
+                parsed.usage_error = "--scrollback-lines requires a number of lines";
+                return parsed;
+            };
+            continue;
+        }
         if (std.mem.startsWith(u8, arg, "-") and arg.len > 1) {
             parsed.usage_error = "unknown flag before the session name";
             return parsed;
@@ -294,13 +311,14 @@ fn flagValue(argv: []const []const u8, i: *usize, comptime flag: []const u8) ??[
 }
 
 test "parseArgs: flags before the name, command after it" {
-    const argv: []const []const u8 = &.{ "--json", "--labels", "a=1 b=2", "--timeout-ms=250", "work", "--", "/bin/sh", "-c", "echo --json" };
+    const argv: []const []const u8 = &.{ "--json", "--labels", "a=1 b=2", "--timeout-ms=250", "--scrollback-lines", "9000", "work", "--", "/bin/sh", "-c", "echo --json" };
     const p = parseArgs(argv);
     try std.testing.expect(p.json);
     try std.testing.expectEqualStrings("a=1 b=2", p.labels.?);
     try std.testing.expectEqual(@as(u32, 250), p.timeout_ms);
+    try std.testing.expectEqual(@as(?usize, 9000), p.scrollback_lines);
     try std.testing.expectEqualStrings("work", p.name);
-    try std.testing.expectEqual(@as(usize, 6), p.command_start);
+    try std.testing.expectEqual(@as(usize, 8), p.command_start);
     try std.testing.expect(p.usage_error == null);
 }
 
@@ -316,6 +334,7 @@ test "parseArgs: the separator is optional and only stripped once" {
 test "parseArgs: reports malformed flags and no command" {
     try std.testing.expect(parseArgs(&.{"--labels"}).usage_error != null);
     try std.testing.expect(parseArgs(&.{ "--timeout-ms", "soon", "x" }).usage_error != null);
+    try std.testing.expect(parseArgs(&.{ "--scrollback-lines", "many", "x" }).usage_error != null);
     try std.testing.expect(parseArgs(&.{ "--bogus", "x" }).usage_error != null);
     const bare = parseArgs(&.{"x"});
     try std.testing.expectEqual(bare.command_start, @as(usize, 1));

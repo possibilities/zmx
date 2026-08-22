@@ -7,6 +7,14 @@ const label = @import("label.zig");
 const lib_posix = @import("posix.zig");
 const testing = std.testing;
 
+/// History crosses the socket in frames of at most this many bytes. A frame
+/// of exactly this length says more follows; the first shorter one (possibly
+/// empty) is the last. A client that predates chunking prints the first
+/// frame and stops, so anything that fit one frame before still arrives
+/// whole; a daemon that predates it sends one frame, which is shorter than
+/// this unless the history is exactly this long.
+pub const history_chunk: usize = 1024 * 1024;
+
 pub const SessionEntry = struct {
     name: []const u8,
     pid: ?i32,
@@ -1785,6 +1793,7 @@ fn testCreateTerminal(alloc: std.mem.Allocator, io: std.Io, cols: u16, rows: u16
     var term = try ghostty_vt.Terminal.init(io, alloc, .{
         .cols = cols,
         .rows = rows,
+        .max_scrollback_bytes = null,
         .max_scrollback_lines = 2_000,
     });
     if (vt_data.len > 0) {
@@ -1817,6 +1826,7 @@ fn serializeRoundtrip(alloc: std.mem.Allocator, io: std.Io, source: *ghostty_vt.
     var dest = try ghostty_vt.Terminal.init(io, alloc, .{
         .cols = source.screens.active.pages.cols,
         .rows = source.screens.active.pages.rows,
+        .max_scrollback_bytes = null,
         .max_scrollback_lines = 2_000,
     });
     var stream = dest.vtStream();

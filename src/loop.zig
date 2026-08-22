@@ -1638,16 +1638,30 @@ pub const Daemon = struct {
             .plain;
         if (util.serializeTerminal(gpa, term, format)) |output| {
             defer gpa.free(output);
-            // A scrollback that does not fit one frame answers empty. Letting
-            // the error out would leave daemonLoop through its teardown and
-            // kill the session -- for a read-only command someone just typed.
-            ipc.appendMessage(gpa, &client.write_buf, .History, output) catch |err| {
-                std.log.warn(
-                    "history too large to send session={s} bytes={d} err={s}",
-                    .{ self.session_name, output.len, @errorName(err) },
-                );
-                ipc.appendMessage(gpa, &client.write_buf, .History, "") catch {};
-            };
+            // As many frames as it takes, so the frame size is not a cap on
+            // what history can show. A full frame says more follows; the
+            // last one is shorter, and is empty when the length divides
+            // exactly. A failure to buffer must not leave the handler: the
+            // error would take daemonLoop through its teardown and kill the
+            // session -- for a read-only command someone just typed.
+            var offset: usize = 0;
+            while (true) {
+                const end = @min(offset + util.history_chunk, output.len);
+                const chunk = output[offset..end];
+                ipc.appendMessage(gpa, &client.write_buf, .History, chunk) catch |err| {
+                    std.log.warn(
+                        "failed to buffer history session={s} bytes={d} err={s}",
+                        .{ self.session_name, output.len, @errorName(err) },
+                    );
+                    // Close the sequence so the client is not left waiting.
+                    ipc.appendMessage(gpa, &client.write_buf, .History, "") catch {};
+                    break;
+                };
+                offset = end;
+                // A chunk shorter than a full frame was the last. A full one
+                // is followed by another, empty when nothing remains.
+                if (chunk.len < util.history_chunk) break;
+            }
             client.has_pending_output = true;
         } else {
             try ipc.appendMessage(gpa, &client.write_buf, .History, "");
@@ -1667,7 +1681,15 @@ pub const Daemon = struct {
         self.setPwd(term);
         const output = util.serializeTerminalRange(gpa, term, format, request.rows);
         defer if (output) |text| gpa.free(text);
-        try ipc.appendMessage(gpa, &client.write_buf, .Capture, output orelse "");
+        const text = output orelse "";
+        var offset: usize = 0;
+        while (true) {
+            const end = @min(offset + util.history_chunk, text.len);
+            const chunk = text[offset..end];
+            try ipc.appendMessage(gpa, &client.write_buf, .Capture, chunk);
+            offset = end;
+            if (chunk.len < util.history_chunk) break;
+        }
         client.has_pending_output = true;
     }
 

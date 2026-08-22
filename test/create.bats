@@ -135,3 +135,53 @@ wait_for_no_process() {
   run "$ZMX" list --short
   [[ "$output" == "" ]]
 }
+
+@test "create --scrollback-lines: the restore keeps that many lines" {
+  local gen='seq -f "%05g ................................................................" 1 3000; sleep 60'
+  "$ZMX" create --scrollback-lines 2500 c-sb /bin/sh -c "$gen" >/dev/null
+  ZMX_SCROLLBACK_LINES=100 "$ZMX" create c-sb-env /bin/sh -c "$gen" >/dev/null
+  local i=0
+  while (( i < 100 )); do
+    "$ZMX" history c-sb | grep -q '^03000 ' && "$ZMX" history c-sb-env | grep -q '^03000 ' && break
+    sleep 0.1; (( i++ )) || true
+  done
+  sleep 0.3
+
+  # ghostty prunes whole pages, so the kept count lands somewhat under the
+  # limit, never over it by more than the visible screen.
+  local big small
+  big=$("$ZMX" history c-sb | grep -c '^0[0-9]\{4\} ')
+  small=$("$ZMX" history c-sb-env | grep -c '^0[0-9]\{4\} ')
+  (( big >= 1800 && big <= 2600 )) || { echo "c-sb kept $big lines" >&2; false; }
+  (( small >= 24 && small <= 500 )) || { echo "c-sb-env kept $small lines" >&2; false; }
+  (( big > small ))
+}
+
+@test "history: a scrollback larger than one frame arrives whole" {
+  local gen='seq -f "%06g ----------------------------------------------------------------------------------------------------" 1 11000; echo FIN; sleep 60'
+  "$ZMX" create --scrollback-lines 20000 c-hist /bin/sh -c "$gen" >/dev/null
+  local i=0
+  while (( i < 300 )); do
+    "$ZMX" history c-hist | grep -q '^FIN' && break
+    sleep 0.1; (( i++ )) || true
+  done
+  local bytes
+  bytes=$("$ZMX" history c-hist | wc -c | tr -d ' ')
+  (( bytes > 1100000 )) || { echo "history is only $bytes bytes" >&2; false; }
+  run bash -c "\"$ZMX\" history c-hist | grep -c '^0[0-9]\{5\} '"
+  [ "$output" -eq 11000 ]
+  run bash -c "\"$ZMX\" history c-hist | head -1 | cut -c1-6"
+  [ "$output" == "000001" ]
+  # Scoped capture uses its own request/reply tag but the same completion
+  # contract. Large captures must reach the CLI whole; screen-only must not
+  # accidentally fall back to the complete history.
+  run bash -o pipefail -c '
+    "$1" history --scrollback 20000 c-hist | grep -c "^0[0-9]\{5\} "
+  ' _ "$ZMX"
+  [ "$status" -eq 0 ]
+  [ "$output" -eq 16000 ]
+  run "$ZMX" history --screen c-hist
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"FIN"* ]]
+  [[ "$output" != *"000001 "* ]]
+}

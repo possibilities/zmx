@@ -266,6 +266,7 @@ pub fn main(init: std.process.Init) !void {
             .labels = parsed.labels,
             .json = parsed.json,
             .timeout_ms = parsed.timeout_ms,
+            .scrollback_lines = parsed.scrollback_lines,
             .cwd = cwd,
             .shell = shell_env,
         });
@@ -624,7 +625,9 @@ fn help(io: std.Io) !void {
         \\  only once the command is running -- or reports why it is not:
         \\  ExecFailed (with the cause), DaemonFailed, Timeout. --json prints one
         \\  object with ok, name, socketPath, pid, createdAt, or ok:false with
-        \\  error and message. --timeout-ms bounds the wait (default 5000).
+        \\  error and message. --timeout-ms bounds the wait (default 5000);
+        \\  --scrollback-lines sets how much a restore can replay (default
+        \\  10000, or ZMX_SCROLLBACK_LINES).
         \\
         \\    zmx create --json --labels "owner=me" build -- make -j8
         \\
@@ -1618,8 +1621,14 @@ fn history(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []cons
 
         while (sb.next()) |msg| {
             if (msg.header.tag == reply_tag) {
-                _ = lib_posix.write(lib_posix.STDOUT_FILENO, msg.payload) catch return;
-                return;
+                var rest = msg.payload;
+                while (rest.len > 0) {
+                    const written = lib_posix.write(lib_posix.STDOUT_FILENO, rest) catch return;
+                    rest = rest[written..];
+                }
+                // A full frame means more follows; the first shorter one
+                // (possibly empty) is the last.
+                if (msg.payload.len < util.history_chunk) return;
             }
             if (scrollback_rows != null and msg.header.tag == .Info) {
                 return printError(io, "session \"{s}\" does not support --screen/--scrollback (daemon too old?)", .{session_name});

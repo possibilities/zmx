@@ -9,10 +9,12 @@ const cross = @import("cross.zig");
 
 socket_dir: []const u8,
 log_dir: []const u8,
-max_scrollback_lines: usize = 10_000,
+max_scrollback_lines: usize = default_scrollback_lines,
 dir_mode: u32 = 0o750,
 log_mode: u32 = 0o640,
 tracked_envs: []const u8 = "DISPLAY,SSH_AUTH_SOCK,SSH_AGENT_PID,SSH_CONNECTION,WINDOWID,XAUTHORITY,KITTY_LISTEN_ON,KITTY_PID,KITTY_WINDOW_ID",
+
+pub const default_scrollback_lines: usize = 10_000;
 
 pub fn init(alloc: std.mem.Allocator, io: std.Io) !Cfg {
     const socket_dir = try socketDir(alloc);
@@ -30,11 +32,19 @@ pub fn init(alloc: std.mem.Allocator, io: std.Io) !Cfg {
     else
         0o640;
 
+    // Lines of scrollback the shadow terminal keeps, which is what a restore
+    // can replay. Unset or unparsable keeps the default.
+    const scrollback = if (lib_posix.getenv("ZMX_SCROLLBACK_LINES")) |m|
+        std.fmt.parseInt(usize, m, 10) catch default_scrollback_lines
+    else
+        default_scrollback_lines;
+
     var cfg = Cfg{
         .socket_dir = socket_dir,
         .log_dir = log_dir,
         .dir_mode = dir_mode,
         .log_mode = log_mode,
+        .max_scrollback_lines = scrollback,
     };
 
     try cfg.mkdir(io);
@@ -156,4 +166,21 @@ test "mkdirAll fails on dangling symlink instead of looping" {
 
     const perms = std.Io.Dir.Permissions.fromMode(0o750);
     try std.testing.expectError(error.NotDir, mkdirAll(std.testing.io, target_path, perms));
+}
+
+test "Cfg.init reads ZMX_SCROLLBACK_LINES, ignoring nonsense" {
+    const alloc = std.testing.allocator;
+    _ = cross.c.setenv("ZMX_SCROLLBACK_LINES", "50000", 1);
+    defer _ = cross.c.unsetenv("ZMX_SCROLLBACK_LINES");
+    {
+        var cfg = try Cfg.init(alloc, std.testing.io);
+        defer cfg.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 50000), cfg.max_scrollback_lines);
+    }
+    _ = cross.c.setenv("ZMX_SCROLLBACK_LINES", "lots", 1);
+    {
+        var cfg = try Cfg.init(alloc, std.testing.io);
+        defer cfg.deinit(alloc);
+        try std.testing.expectEqual(default_scrollback_lines, cfg.max_scrollback_lines);
+    }
 }
