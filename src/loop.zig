@@ -960,12 +960,12 @@ pub const Daemon = struct {
         var out_buf: [2048]u8 = undefined;
         switch (report) {
             .ready => {
-                var w = std.Io.File.stdout().writer(io, &out_buf);
+                var w = std.Io.File.stdout().writerStreaming(io, &out_buf);
                 try w.interface.print("session \"{s}\" created\n", .{self.session_name});
                 try w.interface.flush();
             },
             .exec_failed => |name| {
-                var w = std.Io.File.stderr().writer(io, &out_buf);
+                var w = std.Io.File.stderr().writerStreaming(io, &out_buf);
                 try w.interface.print(
                     "error: session \"{s}\": command failed to start: {s}\n",
                     .{ self.session_name, name },
@@ -976,7 +976,7 @@ pub const Daemon = struct {
                 std.process.exit(1);
             },
             .daemon_failed => {
-                var w = std.Io.File.stderr().writer(io, &out_buf);
+                var w = std.Io.File.stderr().writerStreaming(io, &out_buf);
                 try w.interface.print(
                     "error: session \"{s}\": daemon exited before it was ready (see the log)\n",
                     .{self.session_name},

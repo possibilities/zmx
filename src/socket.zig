@@ -34,7 +34,7 @@ pub fn resolveSessionOrEnv(alloc: std.mem.Allocator, io: std.Io, session_name: ?
         if (std.mem.eql(u8, name, ".")) blk: {
             if (sesh_env.len > 0) break :blk sesh_env;
             var buf: [4096]u8 = undefined;
-            var w = std.Io.File.stderr().writer(io, &buf);
+            var w = std.Io.File.stderr().writerStreaming(io, &buf);
             w.interface.print("error: \".\" requires ZMX_SESSION (are you inside a zmx session?)\n", .{}) catch {};
             w.interface.flush() catch {};
             return error.SessionNameRequired;
@@ -139,7 +139,7 @@ pub fn getSocketPath(
 
 pub fn printSessionNameTooLong(io: std.Io, session_name: []const u8, socket_dir: []const u8) noreturn {
     var buf: [4096]u8 = undefined;
-    var w = std.Io.File.stderr().writer(io, &buf);
+    var w = std.Io.File.stderr().writerStreaming(io, &buf);
     if (maxSessionNameLen(socket_dir)) |max_len| {
         w.interface.print(
             "error: session name is too long ({d} bytes, max {d} for socket directory \"{s}\")\n",

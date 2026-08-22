@@ -30,7 +30,7 @@ fn detectHelp(arg: []const u8) bool {
 /// Prints an error message to stderr and exits with status 1.
 fn printError(io: std.Io, comptime fmt: []const u8, args: anytype) noreturn {
     var buf: [4096]u8 = undefined;
-    var w = std.Io.File.stderr().writer(io, &buf);
+    var w = std.Io.File.stderr().writerStreaming(io, &buf);
     w.interface.print("error: " ++ fmt ++ "\n", args) catch {};
     w.interface.flush() catch {};
     std.process.exit(1);
@@ -284,7 +284,7 @@ pub fn main(init: std.process.Init) !void {
         };
     } else if (std.mem.eql(u8, cmd, "kill") or std.mem.eql(u8, cmd, "k")) {
         var stderr_buffer: [1024]u8 = undefined;
-        var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
+        var stderr_writer = std.Io.File.stderr().writerStreaming(io, &stderr_buffer);
         const stderr = &stderr_writer.interface;
 
         var matchers: std.ArrayList(socket.SessionMatch) = .empty;
@@ -677,14 +677,14 @@ fn help(io: std.Io) !void {
         \\
     ;
     var buf: [8192]u8 = undefined;
-    var w = std.Io.File.stdout().writer(io, &buf);
+    var w = std.Io.File.stdout().writerStreaming(io, &buf);
     try w.interface.print(help_text, .{});
     try w.interface.flush();
 }
 
 fn printVersion(io: std.Io, cfg: *Cfg) !void {
     var buf: [256]u8 = undefined;
-    var w = std.Io.File.stdout().writer(io, &buf);
+    var w = std.Io.File.stdout().writerStreaming(io, &buf);
     try w.interface.print(
         "zmx\t\t{s}\nghostty_vt\t{s}\nsocket_dir\t{s}\nlog_dir\t\t{s}\n",
         .{ version, ghostty_version, cfg.socket_dir, cfg.log_dir },
@@ -695,7 +695,7 @@ fn printVersion(io: std.Io, cfg: *Cfg) !void {
 fn printCompletions(io: std.Io, shell: completions.Shell) !void {
     const script = shell.getCompletionScript();
     var buf: [8192]u8 = undefined;
-    var w = std.Io.File.stdout().writer(io, &buf);
+    var w = std.Io.File.stdout().writerStreaming(io, &buf);
     try w.interface.print("{s}\n", .{script});
     try w.interface.flush();
 }
@@ -856,11 +856,11 @@ fn tail(alloc: std.mem.Allocator, client_socket_fds: std.ArrayList(i32), detache
 
 fn wait(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, matchers: std.ArrayList(socket.SessionMatch)) !void {
     var stdout_buffer: [1024]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
 
     var stderr_buffer: [1024]u8 = undefined;
-    var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
+    var stderr_writer = std.Io.File.stderr().writerStreaming(io, &stderr_buffer);
     const stderr = &stderr_writer.interface;
 
     // Highest match count seen so far. Lets us distinguish "sessions haven't
@@ -1039,7 +1039,7 @@ fn wait(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, matchers: std.ArrayList
 fn list(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, short: bool) !void {
     const current_session = socket.getSeshNameFromEnv();
     var buf: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(io, &buf);
+    var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     var sessions = try util.get_session_entries(alloc, io, cfg.socket_dir);
     defer {
         for (sessions.items) |session| {
@@ -1051,7 +1051,7 @@ fn list(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, short: bool) !void {
     if (sessions.items.len == 0) {
         if (short) return;
         var errbuf: [4096]u8 = undefined;
-        var stderr = std.Io.File.stderr().writer(io, &errbuf);
+        var stderr = std.Io.File.stderr().writerStreaming(io, &errbuf);
         try stderr.interface.print("no sessions found in {s}\n", .{cfg.socket_dir});
         try stderr.interface.flush();
         return;
@@ -1118,7 +1118,7 @@ fn kill(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u
         if (force or err == error.ConnectionRefused) {
             socket.cleanupStaleSocket(io, dir, session_name);
             var ebuf: [4096]u8 = undefined;
-            var ew = std.Io.File.stderr().writer(io, &ebuf);
+            var ew = std.Io.File.stderr().writerStreaming(io, &ebuf);
             ew.interface.print("cleaned up stale session {s}\n", .{session_name}) catch {};
             ew.interface.flush() catch {};
             return;
@@ -1145,14 +1145,14 @@ fn kill(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u
     }
 
     var buf: [100]u8 = undefined;
-    var w = std.Io.File.stdout().writer(io, &buf);
+    var w = std.Io.File.stdout().writerStreaming(io, &buf);
     try w.interface.print("killed session {s}\n", .{session_name});
     try w.interface.flush();
 }
 
 fn printLabelError(io: std.Io, session_name: []const u8, err: anyerror) noreturn {
     var buf: [4096]u8 = undefined;
-    var w = std.Io.File.stderr().writer(io, &buf);
+    var w = std.Io.File.stderr().writerStreaming(io, &buf);
     switch (err) {
         error.Timeout => w.interface.print(
             "error: session \"{s}\" does not support labels (daemon too old?)\n",
@@ -1186,7 +1186,7 @@ fn labelGet(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []con
     defer alloc.free(payload);
 
     var buf: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(io, &buf);
+    var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     if (single_kv.len == 0) {
         try stdout.interface.print("{s}", .{payload});
         try stdout.interface.flush();
@@ -1208,7 +1208,7 @@ fn assertLabels(io: std.Io, labels: []const u8) void {
     while (kvs.next()) |kv| {
         label.assertLabel(kv.key, kv.value) catch |err| {
             var buf: [4096]u8 = undefined;
-            var w = std.Io.File.stderr().writer(io, &buf);
+            var w = std.Io.File.stderr().writerStreaming(io, &buf);
             const msg = "error: key-value kvs can only contain [a-z, A-Z, 0-9, -_.] characters";
             switch (err) {
                 error.LabelKeyEmpty => {
@@ -1294,7 +1294,7 @@ fn getEnvValue(key: []const u8, payload: []const u8) error{EnvVarNotFound}![]con
 
 fn printEnvError(io: std.Io, session_name: []const u8, err: anyerror) noreturn {
     var buf: [4096]u8 = undefined;
-    var w = std.Io.File.stderr().writer(io, &buf);
+    var w = std.Io.File.stderr().writerStreaming(io, &buf);
     switch (err) {
         error.SessionNotFound => w.interface.print("error: session \"{s}\" not found\n", .{session_name}) catch {},
         error.DaemonUnresponsive => w.interface.print("error: session \"{s}\" daemon unresponsive\n", .{session_name}) catch {},
@@ -1323,7 +1323,7 @@ fn envGet(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const
     defer alloc.free(payload);
 
     var buf: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(io, &buf);
+    var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     if (single_kv.len > 0) {
         const val = getEnvValue(single_kv, payload) catch |err| {
             printEnvError(io, session_name, err);
@@ -1719,7 +1719,7 @@ fn writeFile(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, file_path: []c
     if (is_daemon_proc) return;
 
     var buf: [4096]u8 = undefined;
-    var w = std.Io.File.stdout().writer(io, &buf);
+    var w = std.Io.File.stdout().writerStreaming(io, &buf);
 
     const stdin_fd = lib_posix.STDIN_FILENO;
     var stdin_buf = try std.ArrayList(u8).initCapacity(gpa, 4096);
@@ -1752,7 +1752,7 @@ fn writeFile(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, file_path: []c
 
     const result = ipc.probeSession(gpa, socket_path) catch |err| {
         var errbuf: [4096]u8 = undefined;
-        var ew = std.Io.File.stderr().writer(io, &errbuf);
+        var ew = std.Io.File.stderr().writerStreaming(io, &errbuf);
         if (err == error.ConnectionRefused) {
             socket.cleanupStaleSocket(io, dir, daemon.session_name);
             ew.interface.print("cleaned up stale session {s}\n", .{daemon.session_name}) catch {};
@@ -1851,7 +1851,7 @@ fn send(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u
     const probe_result = ipc.probeSession(alloc, socket_path) catch |err| {
         std.log.err("session unresponsive: {s}", .{@errorName(err)});
         var errbuf: [4096]u8 = undefined;
-        var ew = std.Io.File.stderr().writer(io, &errbuf);
+        var ew = std.Io.File.stderr().writerStreaming(io, &errbuf);
         if (err == error.ConnectionRefused) {
             socket.cleanupStaleSocket(io, dir, session_name);
             ew.interface.print("cleaned up stale session {s}\n", .{session_name}) catch {};
