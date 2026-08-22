@@ -11,6 +11,7 @@ const Cfg = @import("cfg.zig");
 const signal = @import("signal.zig");
 const assert = std.debug.assert;
 const daemonize = @import("daemonize.zig");
+const exit_record = @import("exit_record.zig");
 const builtin = @import("builtin");
 
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
@@ -815,6 +816,10 @@ pub const Daemon = struct {
     /// returned there. Null in the daemon and when nothing was created.
     startup: ?daemonize.Startup = null,
     startup_name_buf: [daemonize.Startup.max_len]u8 = undefined,
+    /// Leave an exit record (`exited/<name>.json`) when the session ends, for
+    /// a supervisor that was not connected to receive Exit. Set by `create`;
+    /// a session a person attaches to leaves nothing behind, as before.
+    record_exit: bool = false,
 
     pub const default_startup_timeout_ms: u32 = 5000;
 
@@ -983,6 +988,29 @@ pub const Daemon = struct {
         return self.run(io, dir, self.session_name);
     }
 
+    /// Leaves how the session ended on disk. Best effort: the session is
+    /// over either way, and a record that could not be written is logged,
+    /// not fatal.
+    fn writeExitRecord(self: *Daemon, gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) void {
+        const status = self.child_status orelse ipc.Exit{ .reason = self.exit_reason };
+        const labels = label.labelsToU8(gpa, self.labels) catch "";
+        defer if (labels.len > 0) gpa.free(labels);
+        exit_record.write(io, dir, .{
+            .name = self.session_name,
+            .pid = self.pid,
+            .createdAt = self.created_at,
+            .endedAt = @intCast(std.Io.Timestamp.now(io, .real).toSeconds()),
+            .code = status.code,
+            .signal = status.signal,
+            .reason = exit_record.reasonName(status.reason),
+            .labels = labels,
+        }) catch |err| {
+            std.log.warn("failed to write exit record session={s} err={s}", .{ self.session_name, @errorName(err) });
+            return;
+        };
+        std.log.info("exit record written session={s}", .{self.session_name});
+    }
+
     /// The creator's side of the startup report, for the human CLI: says
     /// the session was created, or why it was not. A timeout is a warning,
     /// not a failure -- the session may still come up, and attaching to it
@@ -1144,6 +1172,7 @@ pub const Daemon = struct {
             if (waited.pid == self.pid and self.child_status == null) {
                 self.child_status = ipc.exitFromWaitStatus(waited.status, self.exit_reason);
             }
+            if (self.record_exit) self.writeExitRecord(gpa, new_io, dir);
             self.deinit(gpa);
             lib_posix.close(pty_info.master_fd);
         }

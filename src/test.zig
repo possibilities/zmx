@@ -10,4 +10,5 @@ comptime {
     _ = @import("daemonize.zig");
     _ = @import("create.zig");
     _ = @import("discover.zig");
+    _ = @import("exit_record.zig");
 }

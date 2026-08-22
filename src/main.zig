@@ -15,6 +15,7 @@ const Cfg = @import("cfg.zig");
 const loop = @import("loop.zig");
 const create = @import("create.zig");
 const discover = @import("discover.zig");
+const exit_record = @import("exit_record.zig");
 const Client = loop.Client;
 const Daemon = loop.Daemon;
 const version = build_options.version;
@@ -219,6 +220,23 @@ pub fn main(init: std.process.Init) !void {
         defer gpa.free(env_str);
 
         return attach(gpa, io, &daemon, env_str, parsed.labels);
+    } else if (std.mem.eql(u8, cmd, "forget")) {
+        const session_name = args.next() orelse return error.SessionNameRequired;
+        if (detectHelp(session_name)) return help(io);
+        const sesh = try socket.getSeshName(gpa, session_name);
+        defer gpa.free(sesh);
+        var dir = try std.Io.Dir.openDirAbsolute(io, cfg.socket_dir, .{});
+        defer dir.close(io);
+        const removed = try exit_record.remove(io, dir, sesh);
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.File.stdout().writerStreaming(io, &buf);
+        if (removed) {
+            try w.interface.print("forgot session \"{s}\"\n", .{sesh});
+        } else {
+            try w.interface.print("no exit record for session \"{s}\"\n", .{sesh});
+        }
+        try w.interface.flush();
+        return;
     } else if (std.mem.eql(u8, cmd, "create")) {
         var create_args: std.ArrayList([]const u8) = .empty;
         defer create_args.deinit(gpa);
@@ -582,6 +600,7 @@ fn help(io: std.Io) !void {
         \\  [d]etach                                                   Detach all clients (ctrl+\\ for current client)
         \\  [l]ist|ls [--short|--json|--where k=v]   List active sessions
         \\  [i]nspect <name> [--json] [--where k=v]  Report one session, or that it is absent
+        \\  forget <name>                            Remove a created session's exit record
         \\  [g]et <name>                                               Get session labels
         \\  set <name> k=v ...                                         Set session labels (k= to remove)
         \\  [cl]ear <name>                                             Clear all session labels
@@ -613,8 +632,12 @@ fn help(io: std.Io) !void {
         \\  list --json and inspect report sessions without changing anything: a
         \\  refused socket is reported as state "refused", never deleted (the
         \\  plain list cleans those up). States: live, refused, unreachable,
-        \\  absent. --where k=v keeps sessions whose labels match (repeatable,
-        \\  all must hold); sessions whose labels cannot be read never match.
+        \\  exited, absent. --where k=v keeps sessions whose labels match
+        \\  (repeatable, all must hold); sessions whose labels cannot be read
+        \\  never match. A session started by create leaves an exit record
+        \\  (<socket dir>/exited/<name>.json: code, signal, reason, endedAt,
+        \\  labels) when it ends, reported as state "exited" until forget
+        \\  removes it or create reuses the name.
         \\
         \\  --labels applies labels as the session is created, in the same form
         \\  `zmx set` takes. A caller that creates and then labels in two steps

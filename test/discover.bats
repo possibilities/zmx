@@ -107,3 +107,88 @@ make_refused() {
   [[ "$output" == *"name=d-sweep"*"status=cleaning up"* ]]
   [ ! -e "$ZMX_DIR/d-sweep" ]
 }
+
+# ============================================================================
+# Exit records
+# ============================================================================
+
+@test "exit record: a created session that ends leaves one; attach does not" {
+  "$ZMX" create --labels "owner=t" d-ends /bin/sh -c 'exit 7' >/dev/null
+  "$ZMX" attach d-plain /bin/sh -c 'exit 3' </dev/null >/dev/null 2>&1 || true
+  # The daemon writes the record during its teardown, after the socket goes.
+  local i=0
+  while [[ ! -e "$ZMX_DIR/exited/d-ends.json" && $i -lt 50 ]]; do sleep 0.1; (( i++ )) || true; done
+  [ -e "$ZMX_DIR/exited/d-ends.json" ]
+  sleep 0.5
+  [ ! -e "$ZMX_DIR/exited/d-plain.json" ]
+
+  run "$ZMX" inspect --json d-ends
+  [[ "$output" == '{"name":"d-ends","socketPath":"'"$ZMX_DIR"'/d-ends","state":"exited","pid":'*',"createdAt":'*',"labels":{"owner":"t"},"lifecycle":"exited","exit":{"code":7,"signal":0,"reason":"natural","endedAt":'*'}}' ]]
+
+  run "$ZMX" inspect d-ends
+  [[ "$output" == *"state=exited"*"exit_code=7"*"reason=natural"*"label.owner=t" ]]
+}
+
+@test "exit record: a kill is recorded as requested, with the signal" {
+  "$ZMX" create d-killed /bin/sh -c 'sleep 30' >/dev/null
+  "$ZMX" kill d-killed >/dev/null
+  local i=0
+  while [[ ! -e "$ZMX_DIR/exited/d-killed.json" && $i -lt 50 ]]; do sleep 0.1; (( i++ )) || true; done
+  run "$ZMX" inspect --json d-killed
+  [[ "$output" == *'"exit":{"code":0,"signal":1,"reason":"requested","endedAt":'* ]]
+}
+
+@test "exit record: a command that never started is recorded as exec_failure" {
+  run "$ZMX" create --json d-noexec /nonexistent/program
+  [ "$status" -eq 1 ]
+  local i=0
+  while [[ ! -e "$ZMX_DIR/exited/d-noexec.json" && $i -lt 50 ]]; do sleep 0.1; (( i++ )) || true; done
+  run "$ZMX" inspect --json d-noexec
+  [[ "$output" == *'"reason":"exec_failure"'* ]]
+}
+
+@test "exit record: list --json includes exited sessions, --where filters them" {
+  "$ZMX" create --labels "owner=t" d-gone /bin/sh -c 'exit 0' >/dev/null
+  "$ZMX" create --labels "owner=t" d-here /bin/sh -c 'sleep 30' >/dev/null
+  local i=0
+  while [[ ! -e "$ZMX_DIR/exited/d-gone.json" && $i -lt 50 ]]; do sleep 0.1; (( i++ )) || true; done
+
+  run "$ZMX" list --json
+  [[ "$output" == '[{"name":"d-here",'*'"state":"live"'*'},{"name":"d-gone",'*'"state":"exited"'*'}]' ]]
+  run "$ZMX" list --json --where owner=t
+  [[ "$output" == *'"name":"d-gone"'* ]]
+  run "$ZMX" list --json --where owner=u
+  [ "$output" == "[]" ]
+}
+
+@test "exit record: forget removes it, idempotently; create replaces it" {
+  "$ZMX" create d-again /bin/sh -c 'exit 1' >/dev/null
+  local i=0
+  while [[ ! -e "$ZMX_DIR/exited/d-again.json" && $i -lt 50 ]]; do sleep 0.1; (( i++ )) || true; done
+
+  run "$ZMX" forget d-again
+  [ "$status" -eq 0 ]
+  [ "$output" == 'forgot session "d-again"' ]
+  [ ! -e "$ZMX_DIR/exited/d-again.json" ]
+  run "$ZMX" forget d-again
+  [ "$status" -eq 0 ]
+  [ "$output" == 'no exit record for session "d-again"' ]
+  run "$ZMX" inspect --json d-again
+  [ "$output" == '{"name":"d-again","state":"absent"}' ]
+
+  "$ZMX" create d-again /bin/sh -c 'exit 2' >/dev/null
+  i=0
+  while [[ ! -e "$ZMX_DIR/exited/d-again.json" && $i -lt 50 ]]; do sleep 0.1; (( i++ )) || true; done
+  run "$ZMX" create --json d-again /bin/sh -c 'sleep 30'
+  [ "$status" -eq 0 ]
+  [ ! -e "$ZMX_DIR/exited/d-again.json" ]
+}
+
+@test "exit record: one that cannot be read is reported, not treated as absent" {
+  mkdir -p "$ZMX_DIR/exited"
+  printf '{"name":' > "$ZMX_DIR/exited/d-bad.json"
+  run "$ZMX" inspect --json d-bad
+  [ "$output" == '{"name":"d-bad","socketPath":"'"$ZMX_DIR"'/d-bad","state":"exited","detail":"MalformedExitRecord"}' ]
+  run "$ZMX" list --json
+  [[ "$output" == *'"detail":"MalformedExitRecord"'* ]]
+}

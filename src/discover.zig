@@ -11,6 +11,7 @@ const Cfg = @import("cfg.zig");
 const ipc = @import("ipc.zig");
 const label = @import("label.zig");
 const socket = @import("socket.zig");
+const exit_record = @import("exit_record.zig");
 const util = @import("util.zig");
 
 /// `--where k=v`: keep only sessions whose labels say so. Several are
@@ -98,6 +99,8 @@ pub const State = enum {
     live,
     refused,
     unreachable_,
+    /// No socket, but an exit record says how it ended.
+    exited,
     absent,
 
     pub fn name(self: State) []const u8 {
@@ -138,6 +141,38 @@ pub fn list(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, opts: Options) !void 
         for (sessions.items) |session| {
             if (!matches(session, opts.where)) continue;
             try writeEntry(&js, cfg.socket_dir, session, stateOf(session));
+        }
+        // Then what ended while nobody was connected. A name with a socket
+        // is reported from the socket; its record, if any, is stale.
+        var dir = try std.Io.Dir.openDirAbsolute(io, cfg.socket_dir, .{});
+        defer dir.close(io);
+        var exited = try exit_record.names(gpa, io, dir);
+        defer {
+            for (exited.items) |n| gpa.free(n);
+            exited.deinit(gpa);
+        }
+        std.mem.sort([]const u8, exited.items, {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.lessThan);
+        for (exited.items) |name| {
+            var has_socket = false;
+            for (sessions.items) |session| {
+                if (std.mem.eql(u8, session.name, name)) has_socket = true;
+            }
+            if (has_socket) continue;
+            var record = exit_record.read(gpa, io, dir, name) catch |err| switch (err) {
+                error.Malformed => {
+                    try writeMalformed(&js, cfg.socket_dir, name);
+                    continue;
+                },
+                error.NotFound => continue,
+                error.OutOfMemory => return err,
+            };
+            defer record.deinit();
+            if (!labelsMatch(record.value.labels, opts.where)) continue;
+            try writeExited(&js, cfg.socket_dir, record.value);
         }
         try js.endArray();
         try w.writeByte('\n');
@@ -184,10 +219,35 @@ pub fn inspect(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, name: []const u8, 
         }
     }
 
+    // No socket: it may have ended while nobody was connected.
+    var record: ?std.json.Parsed(exit_record.Record) = null;
+    defer if (record) |*r| r.deinit();
+    var malformed = false;
+    if (found == null and state == .absent) {
+        var dir = try std.Io.Dir.openDirAbsolute(io, cfg.socket_dir, .{});
+        defer dir.close(io);
+        if (exit_record.read(gpa, io, dir, name)) |r| {
+            if (labelsMatch(r.value.labels, opts.where)) {
+                record = r;
+            } else {
+                var owned = r;
+                owned.deinit();
+            }
+        } else |err| switch (err) {
+            error.NotFound => {},
+            error.Malformed => malformed = true,
+            error.OutOfMemory => return err,
+        }
+    }
+
     if (opts.json) {
         var js: std.json.Stringify = .{ .writer = w };
         if (found) |entry| {
             try writeEntry(&js, cfg.socket_dir, entry, state);
+        } else if (record) |r| {
+            try writeExited(&js, cfg.socket_dir, r.value);
+        } else if (malformed) {
+            try writeMalformed(&js, cfg.socket_dir, name);
         } else {
             try js.beginObject();
             try js.objectField("name");
@@ -197,6 +257,21 @@ pub fn inspect(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, name: []const u8, 
             try js.endObject();
         }
         try w.writeByte('\n');
+        try w.flush();
+        return;
+    }
+
+    if (record) |r| {
+        try w.print("name={s}\nstate=exited\npid={d}\ncreated={d}\nended={d}\nexit_code={d}\nsignal={d}\nreason={s}\n", .{
+            r.value.name, r.value.pid, r.value.createdAt, r.value.endedAt, r.value.code, r.value.signal, r.value.reason,
+        });
+        var kvs = label.LabelIterator.init(r.value.labels);
+        while (kvs.next()) |kv| try w.print("label.{s}={s}\n", .{ kv.key, kv.value });
+        try w.flush();
+        return;
+    }
+    if (malformed) {
+        try w.print("name={s}\nstate=exited\ndetail=MalformedExitRecord\n", .{name});
         try w.flush();
         return;
     }
@@ -219,6 +294,68 @@ pub fn inspect(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, name: []const u8, 
         try w.print("name={s}\nstate=absent\n", .{name});
     }
     try w.flush();
+}
+
+fn labelsMatch(labels: []const u8, where: []const Where) bool {
+    for (where) |w| {
+        const found = label.getLabelValueFromPairs(w.key, labels) catch return false;
+        if (!std.mem.eql(u8, found, w.value)) return false;
+    }
+    return true;
+}
+
+/// A session known only by its exit record.
+fn writeExited(js: *std.json.Stringify, socket_dir: []const u8, record: exit_record.Record) !void {
+    try js.beginObject();
+    try js.objectField("name");
+    try js.write(record.name);
+    try js.objectField("socketPath");
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try js.write(try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ socket_dir, record.name }));
+    try js.objectField("state");
+    try js.write(State.exited.name());
+    try js.objectField("pid");
+    try js.write(record.pid);
+    try js.objectField("createdAt");
+    try js.write(record.createdAt);
+    try js.objectField("labels");
+    try js.beginObject();
+    var kvs = label.LabelIterator.init(record.labels);
+    while (kvs.next()) |kv| {
+        try js.objectField(kv.key);
+        try js.write(kv.value);
+    }
+    try js.endObject();
+    try js.objectField("lifecycle");
+    try js.write("exited");
+    try js.objectField("exit");
+    try js.beginObject();
+    try js.objectField("code");
+    try js.write(record.code);
+    try js.objectField("signal");
+    try js.write(record.signal);
+    try js.objectField("reason");
+    try js.write(record.reason);
+    try js.objectField("endedAt");
+    try js.write(record.endedAt);
+    try js.endObject();
+    try js.endObject();
+}
+
+/// An exit record that could not be read. Still reported: a supervisor
+/// treating it as absence would forget a session that did end.
+fn writeMalformed(js: *std.json.Stringify, socket_dir: []const u8, name: []const u8) !void {
+    try js.beginObject();
+    try js.objectField("name");
+    try js.write(name);
+    try js.objectField("socketPath");
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try js.write(try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ socket_dir, name }));
+    try js.objectField("state");
+    try js.write(State.exited.name());
+    try js.objectField("detail");
+    try js.write("MalformedExitRecord");
+    try js.endObject();
 }
 
 fn stateOf(entry: util.SessionEntry) State {
@@ -298,6 +435,26 @@ fn writeEntry(js: *std.json.Stringify, socket_dir: []const u8, entry: util.Sessi
         try js.write(null);
     }
     try js.endObject();
+}
+
+test "writeExited: a session known only by its record" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var js: std.json.Stringify = .{ .writer = &out.writer };
+    try writeExited(&js, "/tmp/d", .{
+        .name = "gone",
+        .pid = 9,
+        .createdAt = 100,
+        .endedAt = 200,
+        .code = 0,
+        .signal = 15,
+        .reason = "requested",
+        .labels = "owner=fmx",
+    });
+    try std.testing.expectEqualStrings(
+        "{\"name\":\"gone\",\"socketPath\":\"/tmp/d/gone\",\"state\":\"exited\",\"pid\":9,\"createdAt\":100,\"labels\":{\"owner\":\"fmx\"},\"lifecycle\":\"exited\",\"exit\":{\"code\":0,\"signal\":15,\"reason\":\"requested\",\"endedAt\":200}}",
+        out.written(),
+    );
 }
 
 test "parseArgs: --where in both forms, ANDed, plus a name" {

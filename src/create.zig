@@ -10,6 +10,7 @@ const std = @import("std");
 const Cfg = @import("cfg.zig");
 const Daemon = @import("loop.zig").Daemon;
 const daemonize = @import("daemonize.zig");
+const exit_record = @import("exit_record.zig");
 const label = @import("label.zig");
 const socket = @import("socket.zig");
 
@@ -96,7 +97,18 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, opts: Options) !u8 
     daemon.shell = opts.shell;
     daemon.initial_labels = opts.labels;
     daemon.startup_timeout_ms = opts.timeout_ms;
+    daemon.record_exit = true;
     std.log.info("socket path={s}", .{daemon.socket_path});
+
+    // A record from an earlier session of this name describes something
+    // that is about to be replaced; a live session must not sit next to it.
+    {
+        var dir = try std.Io.Dir.openDirAbsolute(io, cfg.socket_dir, .{});
+        defer dir.close(io);
+        if (exit_record.remove(io, dir, sesh) catch false) {
+            std.log.info("replaced exit record session={s}", .{sesh});
+        }
+    }
 
     const is_daemon = daemon.createSession(io) catch |err| switch (err) {
         error.AlreadyExists => {
