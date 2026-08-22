@@ -15,7 +15,7 @@ const builtin = @import("builtin");
 
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
 /// mechanism. It will send stdin to the daemon and receive stdout from the daemon.
-pub fn clientLoop(client_sock_fd: i32, env_str: []const u8) !ClientResult {
+pub fn clientLoop(io: std.Io, client_sock_fd: i32, env_str: []const u8) !ClientResult {
     std.log.info("client loop fd={d}", .{client_sock_fd});
     const gpa: std.mem.Allocator = blk: {
         if (builtin.mode == .Debug) {
@@ -43,6 +43,15 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8) !ClientResult {
 
     // Negotiate first; Init (with the terminal size) goes out once the
     // daemon's Welcome says which version it speaks.
+    // A daemon that predates negotiation never answers Hello. Waiting on it
+    // forever would show a blank terminal with no explanation, so the wait is
+    // bounded and says what to do; after Welcome the loop blocks as before.
+    const welcome_timeout_ms = 5000;
+    var welcomed = false;
+    // The boot clock, not the wall clock: a manual time change or an NTP step
+    // must not shorten or extend this wait.
+    const hello_sent = std.Io.Timestamp.now(io, .boot);
+
     var hello_buf: [ipc.max_hello_len]u8 = undefined;
     const hello = try ipc.encodeHello(&hello_buf, .{
         .min_version = ipc.min_protocol_version,
@@ -101,7 +110,19 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8) !ClientResult {
             });
         }
 
-        _ = try lib_posix.poll(poll_fds.items, -1);
+        // A deadline, not a per-poll timeout: a pre-negotiation daemon still
+        // sends frames (a Resize once typing makes this client leader), and
+        // any of them would otherwise re-arm the wait forever.
+        const waited_ms = if (welcomed) 0 else std.Io.Timestamp.now(io, .boot).toMilliseconds() - hello_sent.toMilliseconds();
+        const poll_timeout: i32 = if (welcomed) -1 else @intCast(@max(0, welcome_timeout_ms - waited_ms));
+        _ = try lib_posix.poll(poll_fds.items, poll_timeout);
+        if (!welcomed and std.Io.Timestamp.now(io, .boot).toMilliseconds() - hello_sent.toMilliseconds() >= welcome_timeout_ms) {
+            std.log.err(
+                "no protocol Welcome after {d}ms: this session's daemon predates version negotiation. Kill the session and reattach so it restarts on this binary.",
+                .{welcome_timeout_ms},
+            );
+            return error.ProtocolTimeout;
+        }
 
         if (poll_fds.items[2].revents & lib_posix.POLL.IN != 0) {
             signal.drainSignalPipe();
@@ -154,6 +175,7 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8) !ClientResult {
             while (read_buf.next()) |msg| {
                 switch (msg.header.tag) {
                     .Welcome => {
+                        welcomed = true;
                         const welcome = ipc.decodeWelcome(msg.payload) catch |err| {
                             std.log.err("malformed Welcome err={s}", .{@errorName(err)});
                             return error.ProtocolMismatch;
@@ -621,6 +643,15 @@ pub const Client = struct {
     }
 
     /// Hold live output for a client that has negotiated but not attached.
+    ///
+    /// Past the cap the held bytes are dropped whole rather than truncated: a
+    /// VT stream cut at an arbitrary byte can split an escape sequence and
+    /// corrupt the render, and a partial screen is worse than none. What
+    /// replaces them is the restore Init serializes -- except on a first-ever
+    /// attach, where the daemon sends no restore at all and the bytes are
+    /// simply lost. Closing that gap is the explicit restore boundary the
+    /// lifecycle work adds next; until then this cap is the ceiling on what a
+    /// slow handshake can cost.
     pub fn holdOutput(self: *Client, data: []const u8) void {
         if (self.preready_overflow) return;
         if (self.preready_buf.items.len + data.len > preready_max) {
@@ -1025,10 +1056,30 @@ pub const Daemon = struct {
         }
     }
 
+    /// Client names arrive over the socket, so they are never logged raw:
+    /// anything outside printable ASCII becomes a dot, and the name is
+    /// truncated to the buffer. Otherwise any peer could write newlines and
+    /// control sequences into the daemon log.
+    fn sanitizeName(buf: []u8, name: []const u8) []const u8 {
+        const len = @min(buf.len, name.len);
+        for (name[0..len], 0..) |c, i| buf[i] = if (c >= 0x20 and c < 0x7f) c else '.';
+        return buf[0..len];
+    }
+
     /// Answer a client's Hello. The Welcome is buffered ahead of anything
     /// else so the client reads it before any output; a client the daemon
     /// cannot serve is told so and then closed once that Welcome is flushed.
     pub fn handleHello(self: *Daemon, gpa: std.mem.Allocator, client: *Client, payload: []const u8) !void {
+        // Checked before the payload is decoded: a client past the handshake
+        // is a live terminal, and a stray or malformed tag-19 write from any
+        // process on this socket must not be able to eject it.
+        if (client.phase != .connected) {
+            std.log.warn(
+                "late Hello ignored session={s} fd={d} phase={s}",
+                .{ self.session_name, client.socket_fd, @tagName(client.phase) },
+            );
+            return;
+        }
         const hello = ipc.decodeHello(payload) catch |err| {
             std.log.warn(
                 "malformed Hello session={s} fd={d} err={s}",
@@ -1039,18 +1090,13 @@ pub const Daemon = struct {
             client.has_pending_output = true;
             return;
         };
-        if (client.phase != .connected) {
-            std.log.warn(
-                "repeated Hello ignored session={s} fd={d} client={s}",
-                .{ self.session_name, client.socket_fd, hello.client },
-            );
-            return;
-        }
+        var name_buf: [32]u8 = undefined;
+        const name = sanitizeName(&name_buf, hello.client);
         const welcome = ipc.negotiate(hello);
         client.phase = if (welcome.accepted()) .negotiated else .rejected;
         std.log.info(
             "hello session={s} fd={d} client={s} versions={d}..{d} -> {d}",
-            .{ self.session_name, client.socket_fd, hello.client, hello.min_version, hello.max_version, welcome.version },
+            .{ self.session_name, client.socket_fd, name, hello.min_version, hello.max_version, welcome.version },
         );
         try ipc.appendMessage(gpa, &client.write_buf, .Welcome, &ipc.encodeWelcome(welcome));
         client.has_pending_output = true;
@@ -1064,7 +1110,10 @@ pub const Daemon = struct {
         term: *ghostty_vt.Terminal,
         payload: []const u8,
     ) !void {
-        const size = ipc.decodeResize(payload) catch return;
+        // Registered before anything can return: an Init this daemon cannot
+        // read must still end the handshake, or a negotiated client that sent
+        // a malformed one would never receive output again.
+        //
         // Whatever restore Init buffers below is the first output a
         // negotiated client sees; live output resumes after it. With no
         // restore, the output held since Hello goes out so none is lost.
@@ -1078,6 +1127,13 @@ pub const Daemon = struct {
                 client.has_pending_output = true;
             }
             client.preready_buf.clearAndFree(gpa);
+        };
+        const size = ipc.decodeResize(payload) catch |err| {
+            std.log.warn(
+                "malformed Init session={s} fd={d} len={d} err={s}",
+                .{ self.session_name, client.socket_fd, payload.len, @errorName(err) },
+            );
+            return;
         };
 
         client.is_terminal = true;
@@ -1264,7 +1320,16 @@ pub const Daemon = struct {
             .plain;
         if (util.serializeTerminal(gpa, term, format)) |output| {
             defer gpa.free(output);
-            try ipc.appendMessage(gpa, &client.write_buf, .History, output);
+            // A scrollback that does not fit one frame answers empty. Letting
+            // the error out would leave daemonLoop through its teardown and
+            // kill the session -- for a read-only command someone just typed.
+            ipc.appendMessage(gpa, &client.write_buf, .History, output) catch |err| {
+                std.log.warn(
+                    "history too large to send session={s} bytes={d} err={s}",
+                    .{ self.session_name, output.len, @errorName(err) },
+                );
+                ipc.appendMessage(gpa, &client.write_buf, .History, "") catch {};
+            };
             client.has_pending_output = true;
         } else {
             try ipc.appendMessage(gpa, &client.write_buf, .History, "");
@@ -1375,8 +1440,20 @@ pub const Daemon = struct {
         vt_stream.nextSlice(payload);
         self.setPwd(term);
         self.has_pty_output = true;
+        // Same gating as the PTY broadcast: bytes written into a session by
+        // `zmx print` are output like any other, and must not reach a client
+        // that is mid-handshake ahead of its restore. They are already in the
+        // terminal above, so holding them loses nothing.
         for (self.clients.items) |client| {
-            try ipc.appendMessage(gpa, &client.write_buf, .Output, payload);
+            if (client.phase == .negotiated) {
+                client.holdOutput(payload);
+                continue;
+            }
+            if (!client.receivesLiveOutput()) continue;
+            ipc.appendMessage(gpa, &client.write_buf, .Output, payload) catch |err| {
+                std.log.warn("failed to buffer output for client err={s}", .{@errorName(err)});
+                continue;
+            };
             client.has_pending_output = true;
         }
         if (self.clients.items.len > 0) {
@@ -1454,7 +1531,10 @@ pub const Daemon = struct {
     fn handleLabelGet(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
         const out = try label.labelsToU8(gpa, self.labels);
         defer gpa.free(out);
-        try ipc.appendMessage(gpa, &client.write_buf, .LabelData, out);
+        ipc.appendMessage(gpa, &client.write_buf, .LabelData, out) catch |err| {
+            std.log.warn("labels too large to send err={s}", .{@errorName(err)});
+            ipc.appendMessage(gpa, &client.write_buf, .LabelData, "") catch {};
+        };
         client.has_pending_output = true;
     }
 

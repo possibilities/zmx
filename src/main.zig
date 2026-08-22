@@ -1670,7 +1670,7 @@ fn attach(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, env_str: []const 
     const clear_seq = "\x1b[2J\x1b[H";
     _ = try lib_posix.write(lib_posix.STDOUT_FILENO, clear_seq);
 
-    const looper = try loop.clientLoop(client_sock, env_str);
+    const looper = try loop.clientLoop(io, client_sock, env_str);
     switch (looper.kind) {
         .detach => return,
         .switch_session => {
@@ -1771,6 +1771,13 @@ fn writeFile(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, file_path: []c
 
     ipc.send(result.fd, .Write, wire_buf.items) catch |err| switch (err) {
         error.BrokenPipe, error.ConnectionResetByPeer => return,
+        error.FrameTooLarge => {
+            std.log.err(
+                "input is {d} bytes; a single message carries at most {d}",
+                .{ wire_buf.items.len, ipc.max_payload_len },
+            );
+            return err;
+        },
         else => return err,
     };
 
@@ -1851,6 +1858,13 @@ fn send(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u
 
     ipc.send(probe_result.fd, tag, payload.items) catch |err| switch (err) {
         error.ConnectionResetByPeer, error.BrokenPipe => return,
+        error.FrameTooLarge => {
+            std.log.err(
+                "input is {d} bytes; a single message carries at most {d}",
+                .{ payload.items.len, ipc.max_payload_len },
+            );
+            return err;
+        },
         else => return err,
     };
 }

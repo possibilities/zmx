@@ -269,8 +269,10 @@ pub const Info = extern struct {
 pub fn expectedLength(data: []const u8) ?usize {
     if (data.len < header_len) return null;
     const header = decodeHeader(data[0..header_len]);
-    // header.len comes off the wire; widen to usize before adding so a
-    // near-u32-max value can't wrap (panic in safe mode, UB in release).
+    // A length past the cap is refused by the reader before it gets here;
+    // returning null rather than a sum keeps the arithmetic in range even
+    // where usize is 32 bits, where header_len + 0xFFFFFFFF would wrap.
+    if (header.len > max_payload_len) return null;
     return @as(usize, header_len) + @as(usize, header.len);
 }
 
@@ -372,11 +374,19 @@ pub const SocketBuffer = struct {
         return n;
     }
 
+    /// Rejects an oversized frame the moment its header has arrived, whichever
+    /// frame in the buffer it belongs to: one read can carry several frames,
+    /// and checking only the one at `head` would let a violating header sit
+    /// unnoticed behind a valid frame until some later read happened to look.
     fn checkPendingFrame(self: *SocketBuffer) error{FrameTooLarge}!void {
-        const available = self.buf.items[self.head..];
-        if (available.len < header_len) return;
-        const header = decodeHeader(available[0..header_len]);
-        if (header.len > max_payload_len) return error.FrameTooLarge;
+        var offset = self.head;
+        while (self.buf.items.len - offset >= header_len) {
+            const header = decodeHeader(self.buf.items[offset..][0..header_len]);
+            if (header.len > max_payload_len) return error.FrameTooLarge;
+            const total = header_len + @as(usize, header.len);
+            if (self.buf.items.len - offset < total) return;
+            offset += total;
+        }
     }
 
     /// Returns the next complete message or `null` when none available.
@@ -582,6 +592,15 @@ test "oversized frame header is rejected before its payload arrives" {
     sb.buf.clearRetainingCapacity();
     try sb.buf.appendSlice(alloc, &encodeHeader(.Output, max_payload_len + 1));
     try std.testing.expectError(error.FrameTooLarge, sb.checkPendingFrame());
+
+    // A violating header hiding behind a complete frame is caught in the
+    // same read, not left for a later one that may never come.
+    sb.buf.clearRetainingCapacity();
+    try appendMessage(alloc, &sb.buf, .Output, "hi");
+    try sb.buf.appendSlice(alloc, &encodeHeader(.Output, max_payload_len + 1));
+    try std.testing.expectError(error.FrameTooLarge, sb.checkPendingFrame());
+    // And an oversized length never reaches expectedLength's arithmetic.
+    try std.testing.expectEqual(@as(?usize, null), expectedLength(&encodeHeader(.Output, max_payload_len + 1)));
     // The encoder refuses to announce what the reader would reject.
     var too_big: []const u8 = &.{};
     too_big.len = max_payload_len + 1;
