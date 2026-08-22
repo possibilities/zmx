@@ -45,6 +45,14 @@ load test_helper
   [[ "$output" == *"session \"test-blocking\" created"* ]]
 }
 
+@test "attach: closed piped stdin still waits for the child's exact status" {
+  run bash -c 'exec "$@" </dev/null' _ timeout 5 "$ZMX" attach test-attach-exit /bin/sh -c 'sleep 0.1; exit 7'
+  [ "$status" -eq 7 ]
+
+  run bash -c 'exec "$@" </dev/null' _ timeout 5 "$ZMX" attach test-attach-signal /bin/sh -c 'sleep 0.1; kill -TERM $$'
+  [ "$status" -eq 143 ]
+}
+
 @test "run: requires a command argument" {
   run "$ZMX" run test-nocmd
   [ "$status" -ne 0 ]
@@ -306,4 +314,3 @@ load test_helper
   [[ "$output" != *"<1234567890"* ]]
   [[ "$output" == *"12345678901234567890"* ]]
 }
-

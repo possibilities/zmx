@@ -1670,9 +1670,19 @@ fn attach(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, env_str: []const 
     const clear_seq = "\x1b[2J\x1b[H";
     _ = try lib_posix.write(lib_posix.STDOUT_FILENO, clear_seq);
 
-    const looper = try loop.clientLoop(io, client_sock, env_str);
+    const looper = try loop.clientLoop(io, client_sock, stdin_is_tty, env_str);
     switch (looper.kind) {
-        .detach => return,
+        .detach => {
+            // A session that ended while we watched hands us its child's
+            // status; wearing it makes `zmx attach cmd` usable in a script,
+            // where before the child's exit code was simply lost.
+            if (looper.exit) |status| {
+                _ = lib_posix.write(lib_posix.STDOUT_FILENO, restore_seq) catch {};
+                if (status.signal != 0) std.process.exit(128 +| status.signal);
+                std.process.exit(status.code);
+            }
+            return;
+        },
         .switch_session => {
             if (looper.session_name) |session_name| {
                 // Reset terminal modes when switching sessions
