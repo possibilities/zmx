@@ -331,6 +331,10 @@ pub fn bind(sock: socket_t, addr: *const sockaddr, len: socklen_t) BindError!voi
         .SUCCESS => return,
         .ACCES, .PERM => return error.AccessDenied,
         .ADDRINUSE => return error.AddressInUse,
+        // A Unix socket binds a path: on macOS a path that already exists
+        // is EEXIST, not EADDRINUSE. Same meaning, and callers race for
+        // the name, so it must not fall through to Unexpected.
+        .EXIST => return error.AddressInUse,
         .BADF => unreachable, // always a race condition if this error is returned
         .INVAL => unreachable, // invalid parameters
         .NOTSOCK => unreachable, // invalid `sockfd`

@@ -35,6 +35,8 @@ pub const Options = struct {
 
 /// Machine-readable failure names. Stable: fmx matches on them.
 pub const Failure = enum {
+    /// A flag was malformed or unknown.
+    UsageError,
     /// The name is empty, reserved, or holds a path separator.
     InvalidName,
     InvalidLabel,
@@ -71,17 +73,8 @@ const Report = struct {
 pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, opts: Options) !u8 {
     var msg_buf: [512]u8 = undefined;
 
-    if (opts.command.len == 0) {
-        return fail(io, opts, .{ .ok = false, .name = opts.name, .failure = .CommandRequired, .message = "a command is required" });
-    }
-
-    if (opts.labels) |kvs| {
-        if (invalidLabel(kvs)) |bad| {
-            const message = std.fmt.bufPrint(&msg_buf, "{s}: {s}", .{ describeLabelError(bad.err), bad.text }) catch "invalid label";
-            return fail(io, opts, .{ .ok = false, .name = opts.name, .failure = .InvalidLabel, .message = message });
-        }
-    }
-
+    // Resolved first so every report names the session the same way, prefix
+    // and all, however early it fails.
     const sesh = socket.getSeshName(gpa, opts.name) catch |err| switch (err) {
         error.SessionNameRequired => return fail(io, opts, .{ .ok = false, .name = opts.name, .failure = .InvalidName, .message = "a session name is required", .detail = @errorName(err) }),
         error.InvalidSessionName, error.SessionNameReserved => {
@@ -91,6 +84,17 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, opts: Options) !u8 
         else => return err,
     };
     defer gpa.free(sesh);
+
+    if (opts.command.len == 0) {
+        return fail(io, opts, .{ .ok = false, .name = sesh, .failure = .CommandRequired, .message = "a command is required" });
+    }
+
+    if (opts.labels) |kvs| {
+        if (invalidLabel(kvs)) |bad| {
+            const message = std.fmt.bufPrint(&msg_buf, "{s}: {s}", .{ describeLabelError(bad.err), bad.text }) catch "invalid label";
+            return fail(io, opts, .{ .ok = false, .name = sesh, .failure = .InvalidLabel, .message = message });
+        }
+    }
     const socket_path = socket.getSocketPath(gpa, cfg.socket_dir, sesh) catch |err| switch (err) {
         error.NameTooLong => {
             const message = std.fmt.bufPrint(&msg_buf, "session name \"{s}\" is too long for a socket path under {s}", .{ sesh, cfg.socket_dir }) catch "session name too long";
@@ -122,6 +126,13 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, opts: Options) !u8 
         error.SessionUnreachable => {
             const message = std.fmt.bufPrint(&msg_buf, "session \"{s}\" has a socket that neither answers nor refuses", .{sesh}) catch "session unreachable";
             return fail(io, opts, .{ .ok = false, .name = sesh, .socket_path = socket_path, .failure = .SessionUnreachable, .message = message });
+        },
+        // Another create bound the name between our probe and our bind.
+        // The loser of that race is in exactly the position of a caller
+        // whose name was already taken.
+        error.AddressInUse => {
+            const message = std.fmt.bufPrint(&msg_buf, "session \"{s}\" already exists", .{sesh}) catch "session already exists";
+            return fail(io, opts, .{ .ok = false, .name = sesh, .socket_path = socket_path, .failure = .AlreadyExists, .message = message });
         },
         else => {
             const message = std.fmt.bufPrint(&msg_buf, "could not create session \"{s}\": {s}", .{ sesh, @errorName(err) }) catch "could not create session";
@@ -227,6 +238,10 @@ fn writeJson(w: *std.Io.Writer, report: Report) !void {
 
 pub const Args = struct {
     name: []const u8 = "",
+    /// Set when a flag was malformed; the message says which. Reported in
+    /// whichever form the caller asked for, so `--json` never answers a
+    /// machine with prose.
+    usage_failure: ?Failure = null,
     /// Index into argv of the command's first word; `argv.len` when none.
     command_start: usize = 0,
     labels: ?[]const u8 = null,
@@ -234,9 +249,18 @@ pub const Args = struct {
     timeout_ms: u32 = Daemon.default_startup_timeout_ms,
     scrollback_lines: ?usize = null,
     want_help: bool = false,
-    /// Set when a flag was malformed; the message says which.
     usage_error: ?[]const u8 = null,
 };
+
+/// Writes a usage error in the form the caller asked for.
+pub fn reportUsage(io: std.Io, json: bool, name: []const u8, failure: Failure, message: []const u8) !void {
+    try emit(io, .{ .name = name, .command = &.{}, .json = json, .cwd = "", .shell = "" }, .{
+        .ok = false,
+        .name = name,
+        .failure = failure,
+        .message = message,
+    });
+}
 
 /// Parses what follows `zmx create`. Flags are recognized only before the
 /// session name; everything after it is the command, except that one
@@ -341,23 +365,29 @@ test "parseArgs: reports malformed flags and no command" {
     try std.testing.expect(parseArgs(&.{"-h"}).want_help);
 }
 
-const InvalidLabel = struct { err: label.LabelError, text: []const u8 };
+const InvalidLabel = struct { err: ?label.LabelError, text: []const u8 };
 
+/// Every token must be a `k=v` this daemon would keep. The iterator stops
+/// at the first token without an `=` and silently drops the rest, so
+/// `--labels "a=b c"` would apply half of what was asked for: a caller that
+/// is told its labels were validated must not have any of them dropped.
 fn invalidLabel(labels: []const u8) ?InvalidLabel {
-    var kvs = label.LabelIterator.init(labels);
-    while (kvs.next()) |kv| {
-        label.assertLabel(kv.key, kv.value) catch |err| {
+    var words = std.mem.tokenizeScalar(u8, labels, ' ');
+    while (words.next()) |word| {
+        const eq = std.mem.indexOfScalar(u8, word, '=') orelse
+            return .{ .err = null, .text = word };
+        label.assertLabel(word[0..eq], word[eq + 1 ..]) catch |err| {
             return .{ .err = err, .text = switch (err) {
-                error.LabelValueInvalidChar => kv.value,
-                else => kv.key,
+                error.LabelValueInvalidChar => word[eq + 1 ..],
+                else => word[0..eq],
             } };
         };
     }
     return null;
 }
 
-fn describeLabelError(err: label.LabelError) []const u8 {
-    return switch (err) {
+fn describeLabelError(err: ?label.LabelError) []const u8 {
+    return switch (err orelse return "labels are key=value pairs separated by spaces; this is not one") {
         error.LabelKeyEmpty => "label key cannot be empty",
         error.LabelKeyReservedName => "label key is a read-only built-in field",
         error.LabelKeyInvalidChar => "label keys can only contain [a-z, A-Z, 0-9, -_.]",
@@ -392,9 +422,15 @@ test "create report: failures name the error and say why" {
     );
 }
 
-test "create rejects the labels attach would" {
+test "create rejects the labels attach would, and the ones it would drop" {
     try std.testing.expect(invalidLabel("a=1 b=2") == null);
-    try std.testing.expectEqual(label.LabelError.LabelKeyReservedName, invalidLabel("name=x").?.err);
-    try std.testing.expectEqual(label.LabelError.LabelValueInvalidChar, invalidLabel("a=b/c").?.err);
+    try std.testing.expect(invalidLabel("") == null);
+    try std.testing.expect(invalidLabel("   ") == null);
+    try std.testing.expectEqual(label.LabelError.LabelKeyReservedName, invalidLabel("name=x").?.err.?);
+    try std.testing.expectEqual(label.LabelError.LabelValueInvalidChar, invalidLabel("a=b/c").?.err.?);
     try std.testing.expectEqualStrings("b/c", invalidLabel("a=b/c").?.text);
+    // The iterator would keep a=b and drop the rest; both are refused.
+    try std.testing.expectEqualStrings("c", invalidLabel("a=b c").?.text);
+    try std.testing.expect(invalidLabel("a=b c").?.err == null);
+    try std.testing.expectEqualStrings("junk", invalidLabel("junk").?.text);
 }

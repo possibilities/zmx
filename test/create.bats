@@ -185,3 +185,49 @@ wait_for_no_process() {
   [[ "$output" == *"FIN"* ]]
   [[ "$output" != *"000001 "* ]]
 }
+
+@test "create: a timeout larger than poll's int does not panic the creator" {
+  run "$ZMX" create --json --timeout-ms 4294967295 c-bigt -- sleep 30
+  [ "$status" -eq 0 ]
+  [[ "$output" == '{"ok":true,"name":"c-bigt",'* ]]
+}
+
+@test "create: the loser of a creation race is told AlreadyExists" {
+  local out
+  out=$(for i in 1 2 3 4 5 6; do "$ZMX" create --json c-race /bin/sh -c 'sleep 30' & done; wait)
+  [ "$(grep -c '"ok":true' <<<"$out")" -eq 1 ]
+  [ "$(grep -c '"error":"AlreadyExists"' <<<"$out")" -eq 5 ]
+  # No other error, and no Zig trace on stderr.
+  [ "$(grep -c '"error":"Internal"' <<<"$out")" -eq 0 ]
+}
+
+@test "create: labels that would be silently dropped are refused" {
+  # LabelIterator stops at a token with no '=' and drops the rest.
+  run "$ZMX" create --json --labels 'a=b c' c-lbl /bin/sh -c 'sleep 30'
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'"error":"InvalidLabel"'*': c"}' ]]
+  run "$ZMX" create --json --labels 'junk' c-lbl2 /bin/sh -c 'sleep 30'
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'"error":"InvalidLabel"'* ]]
+  run "$ZMX" list --short
+  [ "$output" == "" ]
+}
+
+@test "create --json: a usage error answers in JSON, not prose" {
+  run "$ZMX" create --json --timeout-ms soon c-usage -- sleep 1
+  [ "$status" -eq 1 ]
+  [[ "$output" == '{"ok":false,'*'"error":"UsageError","message":"--timeout-ms requires a number of milliseconds"}' ]]
+  run "$ZMX" create --json --bogus c-usage -- sleep 1
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'"error":"UsageError"'* ]]
+  # Without --json the same errors are prose on stderr.
+  run --separate-stderr "$ZMX" create --timeout-ms soon c-usage -- sleep 1
+  [ "$status" -eq 1 ]
+  [[ "$stderr" == "error: --timeout-ms requires a number of milliseconds" ]]
+}
+
+@test "create: every report names the session the same way, prefix and all" {
+  ZMX_SESSION_PREFIX=pre- run "$ZMX" create --json c-pre
+  [ "$status" -eq 1 ]
+  [[ "$output" == '{"ok":false,"name":"pre-c-pre","error":"CommandRequired"'* ]]
+}

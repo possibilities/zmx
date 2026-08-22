@@ -793,7 +793,7 @@ pub const Daemon = struct {
     cwd_path_buf: [std.fs.max_path_bytes]u8 = undefined,
     has_pty_output: bool = false,
     has_had_client: bool = false,
-    created_at: u64, // unix timestamp (ns)
+    created_at: u64, // unix timestamp (seconds)
     is_task_mode: bool = false, // flag for when session is run as a task
     task_id: [4]u8 = undefined,
     task_exit_code: ?u8 = null, // null = running or n/a, set when task completes
@@ -1034,9 +1034,10 @@ pub const Daemon = struct {
                     .{ self.session_name, name },
                 );
                 try w.interface.flush();
-                // The message is the whole story; an error return would
-                // add a return trace under it in a debug build.
-                std.process.exit(1);
+                // Returned, not exited: the caller's defers restore the
+                // terminal it put in raw mode. Its own handler turns this
+                // into a quiet exit 1.
+                return error.SessionStartFailed;
             },
             .daemon_failed => {
                 var w = std.Io.File.stderr().writerStreaming(io, &out_buf);
@@ -1045,13 +1046,20 @@ pub const Daemon = struct {
                     .{self.session_name},
                 );
                 try w.interface.flush();
-                std.process.exit(1);
+                return error.SessionStartFailed;
             },
             .timeout => {
                 std.log.warn(
                     "no startup report within {d}ms session={s}",
                     .{ self.startup_timeout_ms, self.session_name },
                 );
+                // The log is not where someone waiting at a terminal looks.
+                var w = std.Io.File.stderr().writerStreaming(io, &out_buf);
+                w.interface.print(
+                    "warning: session \"{s}\" did not report within {d}ms; attaching anyway\n",
+                    .{ self.session_name, self.startup_timeout_ms },
+                ) catch {};
+                w.interface.flush() catch {};
             },
         }
     }
@@ -1059,6 +1067,14 @@ pub const Daemon = struct {
     fn run(self: *Daemon, io: std.Io, dir: std.Io.Dir, sesh_name: []const u8) !bool {
         std.log.info("creating session={s}", .{sesh_name});
         const server_sock_fd: lib_posix.socket_t = try socket.createSocket(self.socket_path);
+        // Until the fork succeeds this process owns the file: anything that
+        // fails in between (out of memory, an unreadable cwd) must not leave
+        // a socket nothing is listening on.
+        var bound_socket_is_ours = true;
+        errdefer if (bound_socket_is_ours) {
+            lib_posix.close(server_sock_fd);
+            dir.deleteFile(io, sesh_name) catch {};
+        };
         // Which file is ours, so the teardown can tell whether the name was
         // taken over while it slept and leave a successor's socket alone.
         const socket_inode: ?std.Io.File.INode = if (dir.statFile(io, sesh_name, .{})) |st| st.inode else |_| null;
@@ -1096,11 +1112,12 @@ pub const Daemon = struct {
             &self.startup_name_buf,
         ) catch |err| {
             // Only the daemon side fails here; the creator always gets a
-            // report. So this process owns the socket and must remove it.
-            lib_posix.close(server_sock_fd);
-            dir.deleteFile(io, self.session_name) catch {};
+            // report. So this process still owns the socket and the errdefer
+            // above removes it.
             return err;
         };
+        // Past the fork: the daemon owns the file from here, on every path.
+        bound_socket_is_ours = false;
         const pty_info = switch (outcome) {
             .creator => |report| {
                 // The daemon owns the socket file from here on, whatever it
@@ -1158,11 +1175,6 @@ pub const Daemon = struct {
             break :blk std.heap.c_allocator;
         };
 
-        // Born labelled: applied with the daemon's own allocator, before the
-        // loop accepts a client, so there is no window in which the session
-        // exists without them.
-        if (self.initial_labels) |kvs| try self.applyLabels(gpa, kvs);
-
         defer {
             // Closed first: from here a connect is refused, which every
             // caller reads as "gone", and nothing can hang on the backlog
@@ -1200,6 +1212,12 @@ pub const Daemon = struct {
             self.deinit(gpa);
             lib_posix.close(pty_info.master_fd);
         }
+
+        // Born labelled: applied with the daemon's own allocator, before the
+        // loop accepts a client, so there is no window in which the session
+        // exists without them. After the teardown defer above, so a failure
+        // here still removes the socket and takes the child down.
+        if (self.initial_labels) |kvs| try self.applyLabels(gpa, kvs);
 
         daemonLoop(self, gpa, new_io, server_sock_fd, pty_info.master_fd) catch |err| {
             // The daemon could not go on; the child is taken down with it.

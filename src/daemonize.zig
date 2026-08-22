@@ -128,6 +128,22 @@ fn writeAll(fd: i32, bytes: []const u8) void {
     }
 }
 
+/// `readUntilEof` with a deadline before each read. Null means nothing at
+/// all arrived in time; a report that began and then stalled comes back
+/// short, which reads as a daemon that failed.
+fn readUntilEofBefore(fd: i32, buf: []u8, timeout_ms: i32) ?usize {
+    var poll_fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
+    var len: usize = 0;
+    while (len < buf.len) {
+        const ready = lib_posix.poll(&poll_fds, timeout_ms) catch return len;
+        if (ready == 0) return if (len == 0) null else len;
+        const n = lib_posix.read(fd, buf[len..]) catch break;
+        if (n == 0) break;
+        len += n;
+    }
+    return len;
+}
+
 /// Reads until EOF or the buffer is full. EOF is the signal on both pipes:
 /// the exec pipe closes when the child execs (CLOEXEC) or exits, the startup
 /// pipe when the daemon has said its piece.
@@ -175,6 +191,16 @@ pub fn spawnPty(sesh_name: []const u8, cmd: Cmd, size: ipc.Resize, exec_err_buf:
         // errdefers that delete the parent's socket file).
         exec(sesh_name, cmd) catch |err| {
             std.log.err("child setup failed: {s}", .{@errorName(err)});
+            // exec() put SIGPIPE back to its default; a daemon that stopped
+            // reading would otherwise kill this child mid-report, and the
+            // creator would be told the daemon failed rather than why the
+            // command did.
+            const ign: lib_posix.Sigaction = .{
+                .handler = .{ .handler = lib_posix.SIG.IGN },
+                .mask = lib_posix.sigemptyset(),
+                .flags = 0,
+            };
+            lib_posix.sigaction(lib_posix.SIG.PIPE, &ign, null);
             writeAll(exec_pipe[1], @errorName(err));
             lib_posix.exit(1);
         };
@@ -219,12 +245,16 @@ fn encodeStartup(buf: *[Startup.max_len]u8, pid: i32, exec_err: []const u8) []co
 /// `timeout_ms`. `name_buf` receives the error name, so the returned
 /// `Startup` can point into it.
 fn awaitStartup(fd: i32, timeout_ms: u32, name_buf: *[Startup.max_len]u8) Startup {
-    var poll_fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
-    const ready = lib_posix.poll(&poll_fds, @intCast(timeout_ms)) catch return .daemon_failed;
-    if (ready == 0) return .timeout;
+    // Clamped, not cast: poll takes an i32, and a caller's larger number
+    // would otherwise panic here -- after the daemon is already forked,
+    // which would leave a running session nobody was told about.
+    const budget: i32 = if (timeout_ms > std.math.maxInt(i32)) std.math.maxInt(i32) else @intCast(timeout_ms);
 
     var raw: [Startup.max_len]u8 = undefined;
-    const len = readUntilEof(fd, &raw);
+    // Polled before every read, not just the first: the daemon writes the
+    // report and closes in adjacent statements, but one stopped between
+    // them must not wedge its creator forever.
+    const len = readUntilEofBefore(fd, &raw, budget) orelse return .timeout;
     if (len < 5) return .daemon_failed;
     const pid: i32 = @bitCast(std.mem.readInt(u32, raw[1..5], .little));
     switch (raw[0]) {
@@ -263,6 +293,13 @@ test "startup report crosses a real pipe and honours its deadline" {
     const report = awaitStartup(fds[0], 1000, &name_buf);
     try std.testing.expectEqualStrings("AccessDenied", report.exec_failed);
     lib_posix.close(fds[0]);
+
+    // A timeout larger than poll's i32 is clamped, not panicked: it is the
+    // creator of a session that already exists.
+    const huge = try lib_posix.pipe2(.{ .CLOEXEC = true });
+    lib_posix.close(huge[1]);
+    try std.testing.expectEqual(Startup.daemon_failed, awaitStartup(huge[0], std.math.maxInt(u32), &name_buf));
+    lib_posix.close(huge[0]);
 
     // A daemon that dies before reporting closes the pipe empty.
     const empty = try lib_posix.pipe2(.{ .CLOEXEC = true });

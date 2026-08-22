@@ -94,7 +94,10 @@ pub fn main(init: std.process.Init) !void {
         if (parsed.want_help) return help(io);
         if (parsed.usage_error) |msg| return usageError(io, msg);
         if (parsed.name.len == 0) return error.SessionNameRequired;
-        const sesh = try socket.getSeshName(gpa, parsed.name);
+        const sesh = socket.getSeshName(gpa, parsed.name) catch |err| switch (err) {
+            error.InvalidSessionName, error.SessionNameReserved => return usageError(io, @errorName(err)),
+            else => return err,
+        };
         defer gpa.free(sesh);
         return discover.inspect(gpa, io, &cfg, sesh, .{ .json = parsed.json, .where = parsed.where.items });
     } else if (std.mem.eql(u8, cmd, "get") or std.mem.eql(u8, cmd, "g")) {
@@ -219,7 +222,12 @@ pub fn main(init: std.process.Init) !void {
         const env_str = try getTrackedEnvStr(gpa, env_keys, init.environ_map);
         defer gpa.free(env_str);
 
-        return attach(gpa, io, &daemon, env_str, parsed.labels);
+        return attach(gpa, io, &daemon, env_str, parsed.labels) catch |err| switch (err) {
+            // The session never started and has already said why; the
+            // terminal was restored on the way out of attach.
+            error.SessionStartFailed => std.process.exit(1),
+            else => return err,
+        };
     } else if (std.mem.eql(u8, cmd, "forget")) {
         const session_name = args.next() orelse return error.SessionNameRequired;
         if (detectHelp(session_name)) return help(io);
@@ -249,10 +257,9 @@ pub fn main(init: std.process.Init) !void {
             return help(io);
         }
         if (parsed.usage_error) |msg| {
-            var buf: [4096]u8 = undefined;
-            var w = std.Io.File.stderr().writer(io, &buf);
-            w.interface.print("error: {s}\n", .{msg}) catch {};
-            w.interface.flush() catch {};
+            // In whichever form the caller asked for: a --json caller that
+            // gets prose has nothing to match on.
+            try create.reportUsage(io, parsed.json, parsed.name, .UsageError, msg);
             std.process.exit(1);
         }
 
@@ -305,7 +312,10 @@ pub fn main(init: std.process.Init) !void {
         daemon.is_task_mode = true;
         daemon.shell = shell_env;
         std.log.info("socket path={s}", .{daemon.socket_path});
-        return run(gpa, io, &daemon, detached, cmd_args_raw.items);
+        return run(gpa, io, &daemon, detached, cmd_args_raw.items) catch |err| switch (err) {
+            error.SessionStartFailed => std.process.exit(1),
+            else => return err,
+        };
     } else if (std.mem.eql(u8, cmd, "send") or std.mem.eql(u8, cmd, "s")) {
         const session_name = args.next() orelse "";
         if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
@@ -625,7 +635,9 @@ fn help(io: std.Io) !void {
         \\  only once the command is running -- or reports why it is not:
         \\  ExecFailed (with the cause), DaemonFailed, Timeout. --json prints one
         \\  object with ok, name, socketPath, pid, createdAt, or ok:false with
-        \\  error and message. --timeout-ms bounds the wait (default 5000);
+        \\  error and message; a Timeout says only that no report arrived, so
+        \\  inspect the name before assuming nothing started.
+        \\  --timeout-ms bounds the wait (default 5000);
         \\  --scrollback-lines sets how much a restore can replay (default
         \\  10000, or ZMX_SCROLLBACK_LINES).
         \\
