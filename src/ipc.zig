@@ -347,6 +347,40 @@ test "Info wire size is frozen" {
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(Header));
 }
 
+// Measured with `std.mem.asBytes` on aarch64 and x86_64 little-endian in
+// Debug, ReleaseSafe, and ReleaseFast before the explicit codec existed:
+// Header is tag byte, u32 little-endian length, three zero bytes; Resize is
+// four u16 little-endian fields. These bytes are the wire contract now, not
+// whatever `packed struct` happens to emit.
+test "Header wire bytes are frozen" {
+    const header = Header{ .tag = .Resize, .len = 0x01020304 };
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 0x02, 0x04, 0x03, 0x02, 0x01, 0x00, 0x00, 0x00 },
+        std.mem.asBytes(&header),
+    );
+    const decoded = std.mem.bytesToValue(Header, &[_]u8{ 0x01, 0x05, 0, 0, 0, 0, 0, 0 });
+    try std.testing.expectEqual(Tag.Output, decoded.tag);
+    try std.testing.expectEqual(@as(u32, 5), decoded.len);
+    // An integer outside the enum decodes to itself; `_` arms must handle it.
+    const unknown = std.mem.bytesToValue(Header, &[_]u8{ 200, 0, 0, 0, 0, 0, 0, 0 });
+    try std.testing.expectEqual(@as(u8, 200), @intFromEnum(unknown.tag));
+}
+
+test "Resize wire bytes are frozen" {
+    const size = Resize{ .rows = 24, .cols = 80, .xpixel = 0x0102, .ypixel = 0x0304 };
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 0x18, 0x00, 0x50, 0x00, 0x02, 0x01, 0x04, 0x03 },
+        std.mem.asBytes(&size),
+    );
+    const decoded = std.mem.bytesToValue(Resize, &[_]u8{ 0x18, 0x00, 0x50, 0x00, 0x02, 0x01, 0x04, 0x03 });
+    try std.testing.expectEqual(@as(u16, 24), decoded.rows);
+    try std.testing.expectEqual(@as(u16, 80), decoded.cols);
+    try std.testing.expectEqual(@as(u16, 0x0102), decoded.xpixel);
+    try std.testing.expectEqual(@as(u16, 0x0304), decoded.ypixel);
+}
+
 test "Tag wire values are frozen" {
     inline for (.{
         .{ Tag.Input, 0 },     .{ Tag.Output, 1 },        .{ Tag.Resize, 2 },
