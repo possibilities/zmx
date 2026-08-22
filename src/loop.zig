@@ -488,6 +488,10 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                 }
 
                 while (client.read_buf.next()) |msg| {
+                    // A client whose Hello was refused is on its way out: its
+                    // Welcome(0) still has to flush, but nothing it says is
+                    // acted on, least of all Input reaching the PTY.
+                    if (client.phase == .rejected) break;
                     switch (msg.header.tag) {
                         .Input => try daemon.handleInput(gpa, client, msg.payload),
                         .Send => daemon.handleSend(gpa, msg.payload),
@@ -517,11 +521,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         .Run => try daemon.handleRun(gpa, io, client, msg.payload),
                         .Ack, .TaskComplete, .LabelData, .EnvData, .Welcome => {},
                         .Write => try daemon.handleWrite(gpa, client, msg.payload),
-                        .Hello => {
-                            try daemon.handleHello(gpa, client, msg.payload);
-                            // Nothing after a rejected Hello is read.
-                            if (client.phase == .rejected) break;
-                        },
+                        .Hello => try daemon.handleHello(gpa, client, msg.payload),
                         _ => std.log.warn(
                             "ignoring unknown IPC tag={d}",
                             .{@intFromEnum(msg.header.tag)},
