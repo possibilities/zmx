@@ -164,7 +164,8 @@ pub fn list(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, opts: Options) !void 
             if (has_socket) continue;
             var record = exit_record.read(gpa, io, dir, name) catch |err| switch (err) {
                 error.Malformed => {
-                    try writeMalformed(&js, cfg.socket_dir, name);
+                    // Its labels cannot be read, so it matches no filter.
+                    if (opts.where.len == 0) try writeMalformed(&js, cfg.socket_dir, name);
                     continue;
                 },
                 error.NotFound => continue,
@@ -184,6 +185,36 @@ pub fn list(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, opts: Options) !void 
     for (sessions.items) |session| {
         if (!matches(session, opts.where)) continue;
         try util.writeSessionLine(w, session, false, current_session);
+    }
+    // Then what ended while nobody was connected, so a filtered list shows
+    // the same sessions in either form.
+    var dir = try std.Io.Dir.openDirAbsolute(io, cfg.socket_dir, .{});
+    defer dir.close(io);
+    var exited = try exit_record.names(gpa, io, dir);
+    defer {
+        for (exited.items) |n| gpa.free(n);
+        exited.deinit(gpa);
+    }
+    std.mem.sort([]const u8, exited.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lessThan);
+    for (exited.items) |name| {
+        var has_socket = false;
+        for (sessions.items) |session| {
+            if (std.mem.eql(u8, session.name, name)) has_socket = true;
+        }
+        if (has_socket) continue;
+        var record = exit_record.read(gpa, io, dir, name) catch continue;
+        defer record.deinit();
+        if (!labelsMatch(record.value.labels, opts.where)) continue;
+        try w.print("  name={s}\tstate=exited\tpid={d}\tended={d}\texit_code={d}\tsignal={d}\treason={s}", .{
+            record.value.name, record.value.pid, record.value.endedAt, record.value.code, record.value.signal, record.value.reason,
+        });
+        var kvs = label.LabelIterator.init(record.value.labels);
+        while (kvs.next()) |kv| try w.print("\t{s}={s}", .{ kv.key, kv.value });
+        try w.writeByte('\n');
     }
     try w.flush();
 }
@@ -235,7 +266,8 @@ pub fn inspect(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, name: []const u8, 
             }
         } else |err| switch (err) {
             error.NotFound => {},
-            error.Malformed => malformed = true,
+            // Its labels cannot be read, so it matches no filter.
+            error.Malformed => malformed = opts.where.len == 0,
             error.OutOfMemory => return err,
         }
     }
@@ -251,7 +283,7 @@ pub fn inspect(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, name: []const u8, 
         } else {
             try js.beginObject();
             try js.objectField("name");
-            try js.write(name);
+            try util.jsonText(&js, name);
             try js.objectField("state");
             try js.write(State.absent.name());
             try js.endObject();
@@ -308,10 +340,10 @@ fn labelsMatch(labels: []const u8, where: []const Where) bool {
 fn writeExited(js: *std.json.Stringify, socket_dir: []const u8, record: exit_record.Record) !void {
     try js.beginObject();
     try js.objectField("name");
-    try js.write(record.name);
+    try util.jsonText(js, record.name);
     try js.objectField("socketPath");
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    try js.write(try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ socket_dir, record.name }));
+    try util.jsonText(js, try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ socket_dir, record.name }));
     try js.objectField("state");
     try js.write(State.exited.name());
     try js.objectField("pid");
@@ -335,7 +367,7 @@ fn writeExited(js: *std.json.Stringify, socket_dir: []const u8, record: exit_rec
     try js.objectField("signal");
     try js.write(record.signal);
     try js.objectField("reason");
-    try js.write(record.reason);
+    try util.jsonText(js, record.reason);
     try js.objectField("endedAt");
     try js.write(record.endedAt);
     try js.endObject();
@@ -347,10 +379,10 @@ fn writeExited(js: *std.json.Stringify, socket_dir: []const u8, record: exit_rec
 fn writeMalformed(js: *std.json.Stringify, socket_dir: []const u8, name: []const u8) !void {
     try js.beginObject();
     try js.objectField("name");
-    try js.write(name);
+    try util.jsonText(js, name);
     try js.objectField("socketPath");
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    try js.write(try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ socket_dir, name }));
+    try util.jsonText(js, try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ socket_dir, name }));
     try js.objectField("state");
     try js.write(State.exited.name());
     try js.objectField("detail");
@@ -370,10 +402,10 @@ fn stateOf(entry: util.SessionEntry) State {
 fn writeEntry(js: *std.json.Stringify, socket_dir: []const u8, entry: util.SessionEntry, state: State) !void {
     try js.beginObject();
     try js.objectField("name");
-    try js.write(entry.name);
+    try util.jsonText(js, entry.name);
     try js.objectField("socketPath");
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    try js.write(try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ socket_dir, entry.name }));
+    try util.jsonText(js, try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ socket_dir, entry.name }));
     try js.objectField("state");
     try js.write(state.name());
     if (entry.is_error) {
@@ -390,11 +422,11 @@ fn writeEntry(js: *std.json.Stringify, socket_dir: []const u8, entry: util.Sessi
     try js.write(entry.created_at);
     if (entry.cmd) |cmd| {
         try js.objectField("cmd");
-        try js.write(cmd);
+        try util.jsonText(js, cmd);
     }
     if (entry.cwd) |cwd| {
         try js.objectField("cwd");
-        try js.write(cwd);
+        try util.jsonText(js, cwd);
     }
     try js.objectField("labels");
     try js.beginObject();

@@ -25,7 +25,26 @@ pub fn getSeshName(alloc: std.mem.Allocator, sesh: []const u8) ![]const u8 {
         alloc.free(full);
         return error.InvalidSessionName;
     }
+    // The directories zmx itself keeps under socket_dir. A session by one
+    // of these names would be a socket where a directory is expected.
+    for (reserved_names) |reserved| {
+        if (std.mem.eql(u8, full, reserved)) {
+            alloc.free(full);
+            return error.SessionNameReserved;
+        }
+    }
     return full;
+}
+
+pub const reserved_names = [_][]const u8{ "exited", "logs" };
+
+test "getSeshName refuses the names of zmx's own directories" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.SessionNameReserved, getSeshName(alloc, "exited"));
+    try std.testing.expectError(error.SessionNameReserved, getSeshName(alloc, "logs"));
+    const ok = try getSeshName(alloc, "exited2");
+    defer alloc.free(ok);
+    try std.testing.expectEqualStrings("exited2", ok);
 }
 
 pub fn resolveSessionOrEnv(alloc: std.mem.Allocator, io: std.Io, session_name: ?[]const u8) ![]const u8 {

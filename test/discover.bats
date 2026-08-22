@@ -192,3 +192,82 @@ make_refused() {
   run "$ZMX" list --json
   [[ "$output" == *'"detail":"MalformedExitRecord"'* ]]
 }
+
+@test "a session cannot be named after zmx's own directories" {
+  run "$ZMX" create --json exited /bin/sh -c 'sleep 30'
+  [ "$status" -eq 1 ]
+  [[ "$output" == '{"ok":false,"name":"exited","error":"InvalidName",'*'"detail":"SessionNameReserved"}' ]]
+  [ ! -e "$ZMX_DIR/exited" ] || [ -d "$ZMX_DIR/exited" ]
+  run "$ZMX" create --json logs /bin/sh -c 'sleep 30'
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'"error":"InvalidName"'* ]]
+}
+
+@test "a name is never absent between its socket and its record" {
+  "$ZMX" create d-gap /bin/sh -c 'exit 5' >/dev/null
+  # Poll hard across the teardown: refused, then exited, never absent.
+  local seen=""
+  for i in $(seq 1 40); do
+    local state
+    state=$("$ZMX" inspect --json d-gap | sed -E 's/.*"state":"([a-z]+)".*/\1/')
+    [ "$state" == "absent" ] && { echo "saw absent during teardown after: $seen" >&2; false; }
+    seen="$seen $state"
+    [ "$state" == "exited" ] && break
+    sleep 0.05
+  done
+  [[ "$seen" == *exited* ]]
+}
+
+@test "a record from an earlier session never sits next to a live one" {
+  "$ZMX" create --labels gen=1 d-reuse /bin/sh -c 'sleep 30' >/dev/null
+  "$ZMX" kill d-reuse >/dev/null
+  # Immediately, inside the old daemon's teardown grace.
+  "$ZMX" create --labels gen=2 d-reuse /bin/sh -c 'sleep 30' >/dev/null
+  sleep 1.2
+  run "$ZMX" inspect --json d-reuse
+  [[ "$output" == *'"state":"live"'*'"gen":"2"'* ]]
+  [ ! -e "$ZMX_DIR/exited/d-reuse.json" ]
+}
+
+@test "a non-create session start clears an earlier record of that name" {
+  "$ZMX" create d-mixed /bin/sh -c 'exit 7' >/dev/null
+  local i=0
+  while [[ ! -e "$ZMX_DIR/exited/d-mixed.json" && $i -lt 50 ]]; do sleep 0.1; (( i++ )) || true; done
+  "$ZMX" run d-mixed -d true >/dev/null
+  wait_for_session d-mixed
+  [ ! -e "$ZMX_DIR/exited/d-mixed.json" ]
+  run "$ZMX" inspect --json d-mixed
+  [[ "$output" == *'"state":"live"'* ]]
+}
+
+@test "the daemon's own end is recorded as requested, not as the child's doing" {
+  "$ZMX" create d-term /bin/sh -c 'sleep 30' >/dev/null
+  wait_for_session d-term
+  # The daemon is the child's parent; pgrep on an argv bats may have
+  # rewritten is not something to depend on.
+  local child daemon
+  child=$("$ZMX" inspect --json d-term | sed -E 's/.*"pid":([0-9]+).*/\1/')
+  daemon=$(ps -o ppid= -p "$child" | tr -d ' ')
+  kill -TERM "$daemon"
+  local i=0
+  while [[ ! -e "$ZMX_DIR/exited/d-term.json" && $i -lt 50 ]]; do sleep 0.1; (( i++ )) || true; done
+  run "$ZMX" inspect --json d-term
+  [[ "$output" == *'"reason":"requested"'* ]]
+}
+
+@test "a cmd that is not valid UTF-8 stays a JSON string" {
+  "$ZMX" create d-utf8 /bin/sh -c "$(printf 'sleep 30 #\xff\xfe')" >/dev/null
+  run "$ZMX" inspect --json d-utf8
+  [[ "$output" == *'"cmd":"'*'"'* ]]
+  [[ "$output" != *'"cmd":['* ]]
+}
+
+@test "--where filters exited sessions in the text list too" {
+  "$ZMX" create --labels owner=t d-w1 /bin/sh -c 'exit 0' >/dev/null
+  "$ZMX" create --labels owner=u d-w2 /bin/sh -c 'exit 0' >/dev/null
+  local i=0
+  while [[ ! -e "$ZMX_DIR/exited/d-w2.json" && $i -lt 50 ]]; do sleep 0.1; (( i++ )) || true; done
+  run "$ZMX" list --where owner=t
+  [[ "$output" == *"name=d-w1"*"state=exited"*"owner=t"* ]]
+  [[ "$output" != *"d-w2"* ]]
+}

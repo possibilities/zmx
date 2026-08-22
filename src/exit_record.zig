@@ -12,6 +12,7 @@
 const std = @import("std");
 const ipc = @import("ipc.zig");
 const label = @import("label.zig");
+const util = @import("util.zig");
 
 pub const dir_name = "exited";
 
@@ -40,20 +41,23 @@ pub fn relPath(buf: []u8, name: []const u8) ![]const u8 {
     return std.fmt.bufPrint(buf, dir_name ++ "/{s}.json", .{name});
 }
 
-fn tmpRelPath(buf: []u8, name: []const u8) ![]const u8 {
-    return std.fmt.bufPrint(buf, dir_name ++ "/.{s}.json.tmp", .{name});
+/// One temp file per writer: two daemons of one name can tear down at
+/// once (kill, create, kill inside the grace), and must not share it.
+fn tmpRelPath(buf: []u8, name: []const u8, pid: i32) ![]const u8 {
+    return std.fmt.bufPrint(buf, dir_name ++ "/.{s}.{d}.json.tmp", .{ name, pid });
 }
 
 /// Writes the record atomically: a reader sees the old file, the new file,
-/// or none -- never a partial one. Creates the directory on first use.
-pub fn write(io: std.Io, socket_dir: std.Io.Dir, record: Record) !void {
-    socket_dir.createDir(io, dir_name, .default_dir) catch |err| switch (err) {
+/// or none -- never a partial one. Creates the directory on first use, with
+/// the socket directory's mode; the file takes the log mode.
+pub fn write(io: std.Io, socket_dir: std.Io.Dir, dir_mode: u32, file_mode: u32, record: Record) !void {
+    socket_dir.createDir(io, dir_name, std.Io.Dir.Permissions.fromMode(@intCast(dir_mode))) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
 
-    var tmp_buf: [std.fs.max_name_bytes + 32]u8 = undefined;
-    const tmp = try tmpRelPath(&tmp_buf, record.name);
+    var tmp_buf: [std.fs.max_name_bytes + 48]u8 = undefined;
+    const tmp = try tmpRelPath(&tmp_buf, record.name, record.pid);
     var final_buf: [std.fs.max_name_bytes + 32]u8 = undefined;
     const final = try relPath(&final_buf, record.name);
 
@@ -63,7 +67,7 @@ pub fn write(io: std.Io, socket_dir: std.Io.Dir, record: Record) !void {
     const bytes = fbs.buffered();
 
     {
-        const file = try socket_dir.createFile(io, tmp, .{ .truncate = true });
+        const file = try socket_dir.createFile(io, tmp, .{ .truncate = true, .permissions = std.Io.Dir.Permissions.fromMode(@intCast(file_mode)) });
         defer file.close(io);
         try file.writeStreamingAll(io, bytes);
         file.sync(io) catch {};
@@ -76,7 +80,7 @@ pub fn encode(w: *std.Io.Writer, record: Record) !void {
     var js: std.json.Stringify = .{ .writer = w };
     try js.beginObject();
     try js.objectField("name");
-    try js.write(record.name);
+    try util.jsonText(&js, record.name);
     try js.objectField("pid");
     try js.write(record.pid);
     try js.objectField("createdAt");
@@ -88,14 +92,19 @@ pub fn encode(w: *std.Io.Writer, record: Record) !void {
     try js.objectField("signal");
     try js.write(record.signal);
     try js.objectField("reason");
-    try js.write(record.reason);
+    try util.jsonText(&js, record.reason);
     try js.objectField("labels");
-    try js.write(record.labels);
+    try util.jsonText(&js, record.labels);
     try js.endObject();
     try w.writeByte('\n');
 }
 
 pub const ReadError = error{ NotFound, Malformed } || std.mem.Allocator.Error;
+
+/// Something other than a directory sits where the records live. Every
+/// record is unreadable until it is moved; reported once, not as a
+/// malformed record per name.
+pub const BlockedError = error{RecordsBlocked};
 
 /// Reads the record for `name`. A file that is not a record (truncated,
 /// hand-edited, another version's shape) is `Malformed`, which callers
@@ -104,7 +113,7 @@ pub fn read(gpa: std.mem.Allocator, io: std.Io, socket_dir: std.Io.Dir, name: []
     var path_buf: [std.fs.max_name_bytes + 32]u8 = undefined;
     const path = relPath(&path_buf, name) catch return error.Malformed;
     const bytes = socket_dir.readFileAlloc(io, path, gpa, .limited(64 * 1024)) catch |err| switch (err) {
-        error.FileNotFound => return error.NotFound,
+        error.FileNotFound, error.NotDir => return error.NotFound,
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.Malformed,
     };
@@ -120,7 +129,7 @@ pub fn remove(io: std.Io, socket_dir: std.Io.Dir, name: []const u8) !bool {
     var path_buf: [std.fs.max_name_bytes + 32]u8 = undefined;
     const path = try relPath(&path_buf, name);
     socket_dir.deleteFile(io, path) catch |err| switch (err) {
-        error.FileNotFound => return false,
+        error.FileNotFound, error.NotDir => return false,
         else => return err,
     };
     return true;
@@ -135,14 +144,15 @@ pub fn names(gpa: std.mem.Allocator, io: std.Io, socket_dir: std.Io.Dir) !std.Ar
         out.deinit(gpa);
     }
     var dir = socket_dir.openDir(io, dir_name, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return out,
+        error.FileNotFound, error.NotDir => return out,
         else => return err,
     };
     defer dir.close(io);
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
         if (entry.kind != .file) continue;
-        if (entry.name.len == 0 or entry.name[0] == '.') continue;
+        // A write in progress, not a record. Names may start with a dot.
+        if (std.mem.endsWith(u8, entry.name, ".tmp")) continue;
         if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
         try out.append(gpa, try gpa.dupe(u8, entry.name[0 .. entry.name.len - ".json".len]));
     }
@@ -177,10 +187,12 @@ test "exit record: write, read, list, remove, on a real directory" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try write(io, tmp.dir, .{ .name = "a", .pid = 1, .createdAt = 10, .endedAt = 20, .code = 0, .signal = 9, .reason = "requested" });
-    try write(io, tmp.dir, .{ .name = "b", .pid = 2, .createdAt = 11, .endedAt = 21, .code = 3, .signal = 0, .reason = "natural", .labels = "k=v" });
+    try write(io, tmp.dir, 0o750, 0o640, .{ .name = "a", .pid = 1, .createdAt = 10, .endedAt = 20, .code = 0, .signal = 9, .reason = "requested" });
+    try write(io, tmp.dir, 0o750, 0o640, .{ .name = "b", .pid = 2, .createdAt = 11, .endedAt = 21, .code = 3, .signal = 0, .reason = "natural", .labels = "k=v" });
     // Overwriting is a replace, not an append.
-    try write(io, tmp.dir, .{ .name = "a", .pid = 1, .createdAt = 10, .endedAt = 25, .code = 0, .signal = 15, .reason = "requested" });
+    try write(io, tmp.dir, 0o750, 0o640, .{ .name = "a", .pid = 1, .createdAt = 10, .endedAt = 25, .code = 0, .signal = 15, .reason = "requested" });
+    // A dotted name is a name, not a temp file.
+    try write(io, tmp.dir, 0o750, 0o640, .{ .name = ".dot", .pid = 3, .createdAt = 1, .endedAt = 2, .code = 0, .signal = 0, .reason = "natural" });
 
     var a = try read(gpa, io, tmp.dir, "a");
     defer a.deinit();
@@ -199,7 +211,7 @@ test "exit record: write, read, list, remove, on a real directory" {
         for (listed.items) |n| gpa.free(n);
         listed.deinit(gpa);
     }
-    try std.testing.expectEqual(@as(usize, 2), listed.items.len);
+    try std.testing.expectEqual(@as(usize, 3), listed.items.len);
 
     try std.testing.expect(try remove(io, tmp.dir, "a"));
     try std.testing.expect(!try remove(io, tmp.dir, "a"));

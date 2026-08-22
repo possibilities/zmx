@@ -15,6 +15,45 @@ const testing = std.testing;
 /// this unless the history is exactly this long.
 pub const history_chunk: usize = 1024 * 1024;
 
+/// Writes bytes as a JSON string even when they are not valid UTF-8. The
+/// library would otherwise emit an array of numbers for such a value --
+/// valid JSON, wrong shape -- and a cwd arrives from whatever the child
+/// wrote in an OSC 7, a cmd from argv, neither guaranteed to be UTF-8.
+/// Invalid sequences become U+FFFD.
+pub fn jsonText(js: *std.json.Stringify, bytes: []const u8) !void {
+    if (std.unicode.utf8ValidateSlice(bytes)) return js.write(bytes);
+    var buf: [4096]u8 = undefined;
+    var fixed: std.Io.Writer = .fixed(&buf);
+    var it: usize = 0;
+    while (it < bytes.len) {
+        const len = std.unicode.utf8ByteSequenceLength(bytes[it]) catch {
+            fixed.writeAll("\xEF\xBF\xBD") catch break;
+            it += 1;
+            continue;
+        };
+        if (it + len > bytes.len or !std.unicode.utf8ValidateSlice(bytes[it .. it + len])) {
+            fixed.writeAll("\xEF\xBF\xBD") catch break;
+            it += 1;
+            continue;
+        }
+        fixed.writeAll(bytes[it .. it + len]) catch break;
+        it += len;
+    }
+    return js.write(fixed.buffered());
+}
+
+test "jsonText keeps a string a string" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var js: std.json.Stringify = .{ .writer = &out.writer };
+    try jsonText(&js, "plain \xc3\xa9");
+    try std.testing.expectEqualStrings("\"plain \xc3\xa9\"", out.written());
+    out.clearRetainingCapacity();
+    js = .{ .writer = &out.writer };
+    try jsonText(&js, "bad \xff\xfe end");
+    try std.testing.expectEqualStrings("\"bad \xEF\xBF\xBD\xEF\xBF\xBD end\"", out.written());
+}
+
 pub const SessionEntry = struct {
     name: []const u8,
     pid: ?i32,

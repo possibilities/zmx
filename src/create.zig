@@ -10,9 +10,9 @@ const std = @import("std");
 const Cfg = @import("cfg.zig");
 const Daemon = @import("loop.zig").Daemon;
 const daemonize = @import("daemonize.zig");
-const exit_record = @import("exit_record.zig");
 const label = @import("label.zig");
 const socket = @import("socket.zig");
+const util = @import("util.zig");
 
 pub const Options = struct {
     /// Session name, before any `ZMX_SESSION_PREFIX`.
@@ -35,6 +35,8 @@ pub const Options = struct {
 
 /// Machine-readable failure names. Stable: fmx matches on them.
 pub const Failure = enum {
+    /// The name is empty, reserved, or holds a path separator.
+    InvalidName,
     InvalidLabel,
     CommandRequired,
     NameTooLong,
@@ -80,7 +82,14 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, opts: Options) !u8 
         }
     }
 
-    const sesh = try socket.getSeshName(gpa, opts.name);
+    const sesh = socket.getSeshName(gpa, opts.name) catch |err| switch (err) {
+        error.SessionNameRequired => return fail(io, opts, .{ .ok = false, .name = opts.name, .failure = .InvalidName, .message = "a session name is required", .detail = @errorName(err) }),
+        error.InvalidSessionName, error.SessionNameReserved => {
+            const message = std.fmt.bufPrint(&msg_buf, "session name \"{s}\" cannot be used: {s}", .{ opts.name, @errorName(err) }) catch "invalid session name";
+            return fail(io, opts, .{ .ok = false, .name = opts.name, .failure = .InvalidName, .message = message, .detail = @errorName(err) });
+        },
+        else => return err,
+    };
     defer gpa.free(sesh);
     const socket_path = socket.getSocketPath(gpa, cfg.socket_dir, sesh) catch |err| switch (err) {
         error.NameTooLong => {
@@ -104,16 +113,6 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, opts: Options) !u8 
     daemon.startup_timeout_ms = opts.timeout_ms;
     daemon.record_exit = true;
     std.log.info("socket path={s}", .{daemon.socket_path});
-
-    // A record from an earlier session of this name describes something
-    // that is about to be replaced; a live session must not sit next to it.
-    {
-        var dir = try std.Io.Dir.openDirAbsolute(io, cfg.socket_dir, .{});
-        defer dir.close(io);
-        if (exit_record.remove(io, dir, sesh) catch false) {
-            std.log.info("replaced exit record session={s}", .{sesh});
-        }
-    }
 
     const is_daemon = daemon.createSession(io) catch |err| switch (err) {
         error.AlreadyExists => {
@@ -196,10 +195,10 @@ fn writeJson(w: *std.Io.Writer, report: Report) !void {
     try js.objectField("ok");
     try js.write(report.ok);
     try js.objectField("name");
-    try js.write(report.name);
+    try util.jsonText(&js, report.name);
     if (report.socket_path) |p| {
         try js.objectField("socketPath");
-        try js.write(p);
+        try util.jsonText(&js, p);
     }
     if (report.pid) |pid| {
         try js.objectField("pid");
@@ -213,11 +212,11 @@ fn writeJson(w: *std.Io.Writer, report: Report) !void {
         try js.objectField("error");
         try js.write(@tagName(f));
         try js.objectField("message");
-        try js.write(report.message);
+        try util.jsonText(&js, report.message);
     }
     if (report.detail) |d| {
         try js.objectField("detail");
-        try js.write(d);
+        try util.jsonText(&js, d);
     }
     if (report.timeout_ms) |t| {
         try js.objectField("timeoutMs");

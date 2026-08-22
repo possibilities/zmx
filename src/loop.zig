@@ -371,6 +371,9 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                 "SIGTERM received, shutting down gracefully session={s}",
                 .{daemon.session_name},
             );
+            // Someone asked the daemon to stop: the child's end is requested,
+            // not its own doing.
+            daemon.exit_reason = .requested;
             break :daemon_loop;
         }
 
@@ -995,7 +998,7 @@ pub const Daemon = struct {
         const status = self.child_status orelse ipc.Exit{ .reason = self.exit_reason };
         const labels = label.labelsToU8(gpa, self.labels) catch "";
         defer if (labels.len > 0) gpa.free(labels);
-        exit_record.write(io, dir, .{
+        exit_record.write(io, dir, self.cfg.dir_mode, self.cfg.log_mode, .{
             .name = self.session_name,
             .pid = self.pid,
             .createdAt = self.created_at,
@@ -1056,6 +1059,14 @@ pub const Daemon = struct {
     fn run(self: *Daemon, io: std.Io, dir: std.Io.Dir, sesh_name: []const u8) !bool {
         std.log.info("creating session={s}", .{sesh_name});
         const server_sock_fd: lib_posix.socket_t = try socket.createSocket(self.socket_path);
+        // Which file is ours, so the teardown can tell whether the name was
+        // taken over while it slept and leave a successor's socket alone.
+        const socket_inode: ?std.Io.File.INode = if (dir.statFile(io, sesh_name, .{})) |st| st.inode else |_| null;
+        // Whatever an earlier session of this name left about its ending is
+        // about to be superseded; it must not sit next to a live one.
+        if (exit_record.remove(io, dir, sesh_name) catch false) {
+            std.log.info("replaced exit record session={s}", .{sesh_name});
+        }
         const log_fd = log.log_system.file.?.handle;
 
         var keep_fds_open = [_]i32{ server_sock_fd, dir.handle, log_fd };
@@ -1153,15 +1164,13 @@ pub const Daemon = struct {
         if (self.initial_labels) |kvs| try self.applyLabels(gpa, kvs);
 
         defer {
-            // Close and unlink the listen socket BEFORE handleKill()'s
-            // 500ms SIGHUP->SIGKILL grace sleep. Otherwise a `zmx run`
-            // for the same name issued in that window will hang waiting
-            // for a connect.
+            // Closed first: from here a connect is refused, which every
+            // caller reads as "gone", and nothing can hang on the backlog
+            // during handleKill()'s 500 ms grace. The file itself stays
+            // until the exit record is written, so a name is never absent
+            // without its record: a supervisor that polls sees live,
+            // refused, exited -- never a gap it could read as "nothing".
             lib_posix.close(server_sock_fd);
-            std.log.info("deleting socket file session={s}", .{sesh_name});
-            dir.deleteFile(new_io, sesh_name) catch |err| {
-                std.log.warn("failed to delete socket file err={s}", .{@errorName(err)});
-            };
             // The process group is signalled either way: a child whose status
             // was observed may have left background processes behind. The
             // observed child itself is still a zombie, because waitid's
@@ -1172,12 +1181,32 @@ pub const Daemon = struct {
             if (waited.pid == self.pid and self.child_status == null) {
                 self.child_status = ipc.exitFromWaitStatus(waited.status, self.exit_reason);
             }
-            if (self.record_exit) self.writeExitRecord(gpa, new_io, dir);
+            // A caller that swept our refused socket and recreated the name
+            // owns it now. Its record would be ours to overwrite and its
+            // socket ours to delete: neither happens.
+            const still_ours = blk: {
+                const st = dir.statFile(new_io, sesh_name, .{}) catch break :blk false;
+                break :blk socket_inode != null and st.inode == socket_inode.?;
+            };
+            if (still_ours) {
+                if (self.record_exit) self.writeExitRecord(gpa, new_io, dir);
+                std.log.info("deleting socket file session={s}", .{sesh_name});
+                dir.deleteFile(new_io, sesh_name) catch |err| {
+                    std.log.warn("failed to delete socket file err={s}", .{@errorName(err)});
+                };
+            } else {
+                std.log.info("session name taken over during teardown; leaving it session={s}", .{sesh_name});
+            }
             self.deinit(gpa);
             lib_posix.close(pty_info.master_fd);
         }
 
-        try daemonLoop(self, gpa, new_io, server_sock_fd, pty_info.master_fd);
+        daemonLoop(self, gpa, new_io, server_sock_fd, pty_info.master_fd) catch |err| {
+            // The daemon could not go on; the child is taken down with it.
+            // Said so in the record, before the teardown above runs.
+            if (self.exit_reason == .natural) self.exit_reason = .daemon_failure;
+            return err;
+        };
         std.log.info("daemon loop shutdown", .{});
         return true;
     }
@@ -1321,10 +1350,21 @@ pub const Daemon = struct {
         const name = sanitizeName(&name_buf, hello.client);
         const welcome = ipc.negotiate(hello);
         client.phase = if (welcome.accepted()) .negotiated else .rejected;
-        std.log.info(
-            "hello session={s} fd={d} client={s} versions={d}..{d} -> {d}",
-            .{ self.session_name, client.socket_fd, name, hello.min_version, hello.max_version, welcome.version },
-        );
+        // A handshake this daemon served is a detail; the connect and the
+        // attach are already logged. Discovery probes every session, so at
+        // info this line alone would be most of a busy supervisor's log.
+        // A refusal is not a detail: it is why a client went away.
+        if (welcome.accepted()) {
+            std.log.debug(
+                "hello session={s} fd={d} client={s} versions={d}..{d} -> {d}",
+                .{ self.session_name, client.socket_fd, name, hello.min_version, hello.max_version, welcome.version },
+            );
+        } else {
+            std.log.warn(
+                "refusing client session={s} fd={d} client={s} versions={d}..{d}: this daemon speaks {d}..{d}",
+                .{ self.session_name, client.socket_fd, name, hello.min_version, hello.max_version, ipc.min_protocol_version, ipc.protocol_version },
+            );
+        }
         try ipc.appendMessage(gpa, &client.write_buf, .Welcome, &ipc.encodeWelcome(welcome));
         client.has_pending_output = true;
     }

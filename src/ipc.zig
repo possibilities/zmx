@@ -553,8 +553,13 @@ pub fn probeSession(
             continue;
         }
 
-        // No complete message available, wait for more data
-        const more = lib_posix.poll(&poll_fds, 50) catch break;
+        // No complete message available, wait for more data. A daemon
+        // answers everything it understands in one flush, so once Info and
+        // labels are here a Welcome that has not arrived is not coming
+        // (the daemon predates it): one short poll, not the full wait,
+        // or every old session would cost 50 ms per list.
+        const wait_ms: i32 = if (info_result != null and labels != null) 2 else 50;
+        const more = lib_posix.poll(&poll_fds, wait_ms) catch break;
         if (more == 0) break;
         const n_read = sb.read(fd) catch break;
         if (n_read == 0) break;
