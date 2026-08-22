@@ -335,7 +335,10 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
             });
         }
 
-        _ = try lib_posix.poll(poll_fds.items, -1);
+        // While winding down, poll must come back on its own: the child is
+        // gone, so nothing may arrive to wake us, and the drain check below
+        // still has a reap to retry and a deadline to honour.
+        _ = try lib_posix.poll(poll_fds.items, if (draining_until == null) -1 else 20);
 
         if (poll_fds.items[2].revents & lib_posix.POLL.IN != 0) {
             signal.drainSignalPipe();
@@ -598,14 +601,22 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
         }
 
         if (draining_until) |deadline| {
+            // Retried rather than waited on: a child usually becomes reapable
+            // a moment after its pty closes, and the reap must not block.
+            if (daemon.child_status == null) daemon.finishSession(gpa);
             var pending = false;
             for (daemon.clients.items) |client| {
                 if (client.write_buf.items.len > 0) pending = true;
             }
-            if (!pending or std.Io.Timestamp.now(io, .boot).toMilliseconds() >= deadline) {
-                if (pending) std.log.warn(
+            const expired = std.Io.Timestamp.now(io, .boot).toMilliseconds() >= deadline;
+            if (expired or (daemon.child_status != null and !pending)) {
+                if (expired and pending) std.log.warn(
                     "closing session={s} with output a client never read",
                     .{daemon.session_name},
+                );
+                if (expired and daemon.child_status == null) std.log.warn(
+                    "closing session={s} without accounting for pid={d}",
+                    .{ daemon.session_name, daemon.pid },
                 );
                 daemon.running = false;
             }
@@ -743,8 +754,9 @@ pub const Daemon = struct {
     task_exit_code: ?u8 = null, // null = running or n/a, set when task completes
     task_ended_at: ?u64 = null, // timestamp when task exited
     pty_fd: i32 = -1, // set by daemonLoop so handleRun can probe the foreground process
-    /// What the child's wait status said, once it has been reaped. The
-    /// teardown must not reap again, and clients are told this exactly.
+    /// What the child's exit notification said. `finishSession` observes it
+    /// without reaping, so the zombie keeps its pid and process group pinned
+    /// until teardown has finished using both.
     child_status: ?ipc.Exit = null,
     /// Why the session is ending. A kill request sets it before the child
     /// dies, so the exit the client receives says who caused it.
@@ -979,18 +991,21 @@ pub const Daemon = struct {
             dir.deleteFile(new_io, sesh_name) catch |err| {
                 std.log.warn("failed to delete socket file err={s}", .{@errorName(err)});
             };
-            // A child that already ended has been reaped and reported; only
-            // one that outlived the loop still needs signalling.
+            // A child whose status was observed is still a zombie: waitid's
+            // WNOWAIT keeps its pid and process group pinned until this
+            // teardown is done with them. Only a child that outlived the loop
+            // still needs signalling, but every child still needs reaping.
             if (self.child_status == null) {
                 self.handleKill(gpa, new_io);
-                self.deinit(gpa);
-                lib_posix.close(pty_info.master_fd);
-                _ = lib_posix.waitpid(self.pid, 0);
             } else {
                 self.shutdown(gpa);
-                self.deinit(gpa);
-                lib_posix.close(pty_info.master_fd);
             }
+            const waited = lib_posix.waitpid(self.pid, 0);
+            if (waited.pid == self.pid and self.child_status == null) {
+                self.child_status = ipc.exitFromWaitStatus(waited.status, self.exit_reason);
+            }
+            self.deinit(gpa);
+            lib_posix.close(pty_info.master_fd);
         }
 
         try daemonLoop(self, gpa, new_io, server_sock_fd, pty_info.master_fd);
@@ -1302,7 +1317,7 @@ pub const Daemon = struct {
     /// frames it takes, so scrollback is not capped by the frame size.
     const RESTORE_CHUNK = 1024 * 1024;
 
-    /// Reap the child and tell every attached client how it ended.
+    /// Observe the child and tell every attached client how it ended.
     ///
     /// Ordering is the contract: this runs after the final PTY bytes have
     /// been read and broadcast, so Exit is the last frame a client sees, and
@@ -1311,8 +1326,18 @@ pub const Daemon = struct {
     /// way.
     pub fn finishSession(self: *Daemon, gpa: std.mem.Allocator) void {
         if (self.child_status != null) return;
-        const waited = lib_posix.waitpid(self.pid, 0);
-        const status = ipc.exitFromWaitStatus(waited.status, self.exit_reason);
+        // Never a blocking wait, and never reap here. EOF on the pty master
+        // says every slave fd is closed, which a live process can arrange for
+        // itself -- closing its stdio and carrying on. waitid(WNOWAIT) tells
+        // us only when the child really ended while leaving its zombie in
+        // place, so teardown cannot signal a reused pid or process group.
+        const status = child_wait.peek(self.pid, self.exit_reason) orelse {
+            std.log.info(
+                "pty closed while the child lives session={s} pid={d}",
+                .{ self.session_name, self.pid },
+            );
+            return;
+        };
         self.child_status = status;
         std.log.info(
             "child exited session={s} pid={d} code={d} signal={d} reason={s}",
@@ -1685,6 +1710,45 @@ pub const Daemon = struct {
     }
 };
 
+/// A child's exit status read without reaping it. Linux exposes waitid as a
+/// syscall; the other supported target, macOS, exposes it through libc.
+const child_wait = struct {
+    const W_EXITED_NOHANG_NOWAIT: u32 = switch (builtin.os.tag) {
+        .linux => std.os.linux.W.EXITED | std.os.linux.W.NOHANG | std.os.linux.W.NOWAIT,
+        else => 0x4 | 0x1 | 0x20, // WEXITED | WNOHANG | WNOWAIT on BSDs
+    };
+    const CLD_EXITED: c_int = 1;
+
+    extern "c" fn waitid(idtype: c_uint, id: std.c.pid_t, infop: *std.c.siginfo_t, options: c_int) c_int;
+
+    fn peek(pid: std.c.pid_t, reason: ipc.Exit.Reason) ?ipc.Exit {
+        switch (builtin.os.tag) {
+            .linux => {
+                const linux = std.os.linux;
+                var info = std.mem.zeroes(linux.siginfo_t);
+                const rc = linux.waitid(.PID, pid, &info, W_EXITED_NOHANG_NOWAIT, null);
+                if (linux.errno(rc) != .SUCCESS) return null;
+                if (info.fields.common.first.piduid.pid == 0) return null;
+                return fromSiginfo(info.code, info.fields.common.second.sigchld.status, reason);
+            },
+            else => {
+                var info = std.mem.zeroes(std.c.siginfo_t);
+                if (waitid(1, pid, &info, @intCast(W_EXITED_NOHANG_NOWAIT)) != 0) return null; // P_PID
+                if (info.pid == 0) return null;
+                return fromSiginfo(info.code, info.status, reason);
+            },
+        }
+    }
+
+    fn fromSiginfo(code: c_int, status: i32, reason: ipc.Exit.Reason) ipc.Exit {
+        const value: u32 = @bitCast(status);
+        if (code == CLD_EXITED) {
+            return .{ .code = @truncate(value), .reason = reason };
+        }
+        return .{ .signal = @truncate(value & 0x7f), .reason = reason };
+    }
+};
+
 test "terminal retains the configured scrollback without the default byte cap" {
     const alloc = std.testing.allocator;
     const cfg = Cfg{ .socket_dir = "", .log_dir = "" };
@@ -1855,4 +1919,15 @@ test "handleEnvGet returns leader client's environment variables including unset
     try daemon.handleEnvGet(alloc, &client_req);
     const pay3 = client_req.write_buf.items[ipc.header_len..];
     try std.testing.expectEqualStrings("DISPLAY=:99\n", pay3);
+}
+
+test "waitid status keeps exit code, signal, and reason exact" {
+    try std.testing.expectEqual(
+        ipc.Exit{ .code = 7, .reason = .natural },
+        child_wait.fromSiginfo(child_wait.CLD_EXITED, 7, .natural),
+    );
+    try std.testing.expectEqual(
+        ipc.Exit{ .signal = 9, .reason = .requested },
+        child_wait.fromSiginfo(2, 9, .requested),
+    );
 }
