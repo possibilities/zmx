@@ -1703,9 +1703,11 @@ pub const Daemon = struct {
             // error would take daemonLoop through its teardown and kill the
             // session -- for a read-only command someone just typed.
             var offset: usize = 0;
+            var chunks: usize = 0;
             while (true) {
                 const end = @min(offset + util.history_chunk, output.len);
                 const chunk = output[offset..end];
+                chunks += 1;
                 ipc.appendMessage(gpa, &client.write_buf, .History, chunk) catch |err| {
                     std.log.warn(
                         "failed to buffer history session={s} bytes={d} err={s}",
@@ -1720,6 +1722,10 @@ pub const Daemon = struct {
                 // is followed by another, empty when nothing remains.
                 if (chunk.len < util.history_chunk) break;
             }
+            std.log.info(
+                "history sent session={s} bytes={d} chunks={d}",
+                .{ self.session_name, output.len, chunks },
+            );
             client.has_pending_output = true;
         } else {
             try ipc.appendMessage(gpa, &client.write_buf, .History, "");

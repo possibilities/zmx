@@ -639,7 +639,9 @@ fn help(io: std.Io) !void {
         \\  inspect the name before assuming nothing started.
         \\  --timeout-ms bounds the wait (default 5000);
         \\  --scrollback-lines sets how much a restore can replay (default
-        \\  10000, or ZMX_SCROLLBACK_LINES).
+        \\  10000, or ZMX_SCROLLBACK_LINES). It counts screen rows, so a line
+        \\  that wraps costs more than one, and pruning frees whole pages, so
+        \\  the number is an upper bound rather than an exact retention.
         \\
         \\    zmx create --json --labels "owner=me" build -- make -j8
         \\
@@ -1620,16 +1622,16 @@ fn history(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []cons
     var sb = try ipc.SocketBuffer.init(alloc);
     defer sb.deinit();
 
+    // What was printed is only the whole history if a frame said so. Ending
+    // any other way -- the daemon died, or stopped answering -- would
+    // otherwise be silent truncation reported as success.
     while (true) {
         var poll_fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
-        const poll_result = lib_posix.poll(&poll_fds, 5000) catch return;
-        if (poll_result == 0) {
-            std.log.err("timeout waiting for history response", .{});
-            return;
-        }
+        const poll_result = lib_posix.poll(&poll_fds, 5000) catch return historyEndedEarly(io, session_name, "the connection failed");
+        if (poll_result == 0) return historyEndedEarly(io, session_name, "the session stopped answering");
 
-        const n = sb.read(fd) catch return;
-        if (n == 0) return;
+        const n = sb.read(fd) catch return historyEndedEarly(io, session_name, "the connection failed");
+        if (n == 0) return historyEndedEarly(io, session_name, "the session closed the connection");
 
         while (sb.next()) |msg| {
             if (msg.header.tag == reply_tag) {
@@ -1638,15 +1640,31 @@ fn history(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []cons
                     const written = lib_posix.write(lib_posix.STDOUT_FILENO, rest) catch return;
                     rest = rest[written..];
                 }
-                // A full frame means more follows; the first shorter one
-                // (possibly empty) is the last.
-                if (msg.payload.len < util.history_chunk) return;
+                // Exactly a full frame means more follows. Anything else ends
+                // it -- including a larger frame, which is what a daemon from
+                // before chunking sends: it has no cap to divide by.
+                if (msg.payload.len != util.history_chunk) return;
             }
             if (scrollback_rows != null and msg.header.tag == .Info) {
                 return printError(io, "session \"{s}\" does not support --screen/--scrollback (daemon too old?)", .{session_name});
             }
         }
     }
+}
+
+/// The history stopped arriving before a frame said it was complete.
+/// Whatever reached stdout is a fragment, so say so and fail: a caller
+/// redirecting this to a file must not keep a truncated one as if it were
+/// the session's scrollback.
+fn historyEndedEarly(io: std.Io, session_name: []const u8, why: []const u8) void {
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.File.stderr().writerStreaming(io, &buf);
+    w.interface.print(
+        "error: history of \"{s}\" is incomplete: {s}\n",
+        .{ session_name, why },
+    ) catch {};
+    w.interface.flush() catch {};
+    std.process.exit(1);
 }
 
 fn switchSesh(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, current_sesh: []const u8) !void {

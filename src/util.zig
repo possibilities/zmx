@@ -8,11 +8,15 @@ const lib_posix = @import("posix.zig");
 const testing = std.testing;
 
 /// History crosses the socket in frames of at most this many bytes. A frame
-/// of exactly this length says more follows; the first shorter one (possibly
-/// empty) is the last. A client that predates chunking prints the first
-/// frame and stops, so anything that fit one frame before still arrives
-/// whole; a daemon that predates it sends one frame, which is shorter than
-/// this unless the history is exactly this long.
+/// of exactly this length says more follows; the first frame of any other
+/// length -- shorter, empty, or larger -- is the last.
+///
+/// Larger is how a daemon from before chunking answers: it has no cap to
+/// divide by and sends everything in one frame. Treating that as terminal
+/// is why such a daemon does not leave this client waiting out its timeout.
+/// A client from before chunking prints the first frame and stops, and an
+/// old daemon never held more than a page or two of scrollback, so nothing
+/// that arrived whole before is cut short now.
 pub const history_chunk: usize = 1024 * 1024;
 
 /// Writes bytes as a JSON string even when they are not valid UTF-8. The

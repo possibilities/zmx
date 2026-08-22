@@ -137,7 +137,9 @@ wait_for_no_process() {
 }
 
 @test "create --scrollback-lines: the restore keeps that many lines" {
-  local gen='seq -f "%05g ................................................................" 1 3000; sleep 60'
+  # Lines short enough never to wrap: the limit counts screen rows, so a
+  # wrapped line would make retention depend on the terminal's width.
+  local gen='seq -f "%05g ......................." 1 3000; sleep 60'
   "$ZMX" create --scrollback-lines 2500 c-sb /bin/sh -c "$gen" >/dev/null
   ZMX_SCROLLBACK_LINES=100 "$ZMX" create c-sb-env /bin/sh -c "$gen" >/dev/null
   local i=0
@@ -147,29 +149,33 @@ wait_for_no_process() {
   done
   sleep 0.3
 
-  # ghostty prunes whole pages, so the kept count lands somewhat under the
-  # limit, never over it by more than the visible screen.
+  # ghostty frees whole pages, so a limit is an upper bound, and its floor
+  # is one page -- which is larger on a wide terminal. Hence generous
+  # bounds: what must hold is that each limit is respected and they differ.
   local big small
   big=$("$ZMX" history c-sb | grep -c '^0[0-9]\{4\} ')
   small=$("$ZMX" history c-sb-env | grep -c '^0[0-9]\{4\} ')
-  (( big >= 1800 && big <= 2600 )) || { echo "c-sb kept $big lines" >&2; false; }
-  (( small >= 24 && small <= 500 )) || { echo "c-sb-env kept $small lines" >&2; false; }
-  (( big > small ))
+  (( big >= 1500 && big <= 2600 )) || { echo "c-sb kept $big lines for a 2500 limit" >&2; false; }
+  (( small >= 24 && small <= 1000 )) || { echo "c-sb-env kept $small lines for a 100 limit" >&2; false; }
+  (( big > small * 2 )) || { echo "limits did not separate: $big vs $small" >&2; false; }
 }
 
-@test "history: a scrollback larger than one frame arrives whole" {
-  local gen='seq -f "%06g ----------------------------------------------------------------------------------------------------" 1 11000; echo FIN; sleep 60'
+@test "history: a scrollback larger than one frame arrives whole, in several frames" {
+  # 76 columns of payload: short enough not to wrap at 80, and 16000 rows
+  # stay under the limit at any width, so the whole run is retained.
+  local gen='seq -f "%06g ---------------------------------------------------------------" 1 16000; echo FIN; sleep 60'
   "$ZMX" create --scrollback-lines 20000 c-hist /bin/sh -c "$gen" >/dev/null
   local i=0
-  while (( i < 300 )); do
+  while (( i < 400 )); do
     "$ZMX" history c-hist | grep -q '^FIN' && break
     sleep 0.1; (( i++ )) || true
   done
+
   local bytes
   bytes=$("$ZMX" history c-hist | wc -c | tr -d ' ')
   (( bytes > 1100000 )) || { echo "history is only $bytes bytes" >&2; false; }
   run bash -c "\"$ZMX\" history c-hist | grep -c '^0[0-9]\{5\} '"
-  [ "$output" -eq 11000 ]
+  [ "$output" -eq 16000 ]
   run bash -c "\"$ZMX\" history c-hist | head -1 | cut -c1-6"
   [ "$output" == "000001" ]
   # Scoped capture uses its own request/reply tag but the same completion
@@ -184,6 +190,32 @@ wait_for_no_process() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"FIN"* ]]
   [[ "$output" != *"000001 "* ]]
+  # And it really crossed the socket in more than one frame -- a daemon
+  # that sent one oversized frame would satisfy everything above.
+  run grep -c "chunks=[2-9]" "$ZMX_DIR/logs/c-hist.log"
+  [ "$output" -ge 1 ]
+}
+
+@test "history: a transfer that ends early fails instead of printing a fragment" {
+  local gen='seq -f "%06g ---------------------------------------------------------------" 1 16000; echo FIN; sleep 60'
+  "$ZMX" create --scrollback-lines 20000 c-cut /bin/sh -c "$gen" >/dev/null
+  local i=0
+  while (( i < 400 )); do
+    "$ZMX" history c-cut | grep -q '^FIN' && break
+    sleep 0.1; (( i++ )) || true
+  done
+
+  # Kill the daemon while it is answering: whatever reached stdout is a
+  # fragment, and the exit status has to say so.
+  local child daemon
+  child=$("$ZMX" inspect --json c-cut | sed -E 's/.*"pid":([0-9]+).*/\1/')
+  daemon=$(ps -o ppid= -p "$child" | tr -d ' ')
+  # The killer runs in the background so the client stays in the foreground
+  # and `run` can see its status.
+  ( sleep 0.02; kill -9 "$daemon" ) &
+  run --separate-stderr "$ZMX" history c-cut
+  [ "$status" -ne 0 ]
+  [[ "$stderr" == *"is incomplete"* ]]
 }
 
 @test "create: a timeout larger than poll's int does not panic the creator" {
