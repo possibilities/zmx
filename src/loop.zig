@@ -286,6 +286,12 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
     var marker_carry_len: usize = 0;
 
     var had_terminal_client = daemon.hasTerminalClient();
+    // Set when the child is gone and Exit has been buffered. The loop keeps
+    // going until every client has taken it, so the last frame of a session
+    // is not lost to the socket closing underneath it -- bounded, because a
+    // client that never reads must not keep the daemon alive.
+    var draining_until: ?i64 = null;
+    const drain_grace_ms = 2000;
 
     daemon_loop: while (daemon.running) {
         // If the program asked for focus reports (DECSET 1004), send focus-out
@@ -385,10 +391,14 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                 if (n == 0) {
                     // EOF: Shell exited
                     std.log.info("shell exited pty_fd={d}", .{pty_fd});
-                    // Let the rest of this poll iteration complete so client
-                    // write buffers are flushed via the normal POLLOUT path.
-                    // On the next iteration, daemon.running will be false.
-                    daemon.running = false;
+                    // Everything the child ever wrote has been read by now, so
+                    // this is the moment Exit belongs: after the last output,
+                    // before the socket closes.
+                    daemon.finishSession(gpa);
+                    // Not `running = false` here: Exit was only just buffered,
+                    // and this iteration asked poll for POLLOUT before it
+                    // existed. Draining gives it the iterations it needs.
+                    draining_until = std.Io.Timestamp.now(io, .boot).toMilliseconds() + drain_grace_ms;
                 } else {
                     // Feed PTY output to terminal emulator for state tracking
                     vt_stream.nextSlice(buf[0..n]);
@@ -530,6 +540,9 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                             break :clients_loop;
                         },
                         .Kill => {
+                            // Remembered so the exit says who caused it; the
+                            // teardown does the signalling as it always has.
+                            daemon.exit_reason = .requested;
                             break :daemon_loop;
                         },
                         .Info => try daemon.handleInfo(gpa, client, &term),
@@ -541,7 +554,9 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         .History => try daemon.handleHistory(gpa, client, &term, msg.payload),
                         .Capture => try daemon.handleCapture(gpa, client, &term, msg.payload),
                         .Run => try daemon.handleRun(gpa, io, client, msg.payload),
-                        .Ack, .TaskComplete, .LabelData, .EnvData, .Welcome => {},
+                        // Frames a daemon never receives: these travel the
+                        // other way, and a client sending one says nothing.
+                        .Ack, .TaskComplete, .LabelData, .EnvData, .Welcome, .RestoreBegin, .Ready, .Exit => {},
                         .Write => try daemon.handleWrite(gpa, client, msg.payload),
                         .Hello => try daemon.handleHello(gpa, client, msg.payload),
                         _ => std.log.warn(
@@ -579,6 +594,20 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
             if (revents & (lib_posix.POLL.HUP | lib_posix.POLL.ERR | lib_posix.POLL.NVAL) != 0) {
                 const last = daemon.closeClient(gpa, client, i, false);
                 if (last) break :daemon_loop;
+            }
+        }
+
+        if (draining_until) |deadline| {
+            var pending = false;
+            for (daemon.clients.items) |client| {
+                if (client.write_buf.items.len > 0) pending = true;
+            }
+            if (!pending or std.Io.Timestamp.now(io, .boot).toMilliseconds() >= deadline) {
+                if (pending) std.log.warn(
+                    "closing session={s} with output a client never read",
+                    .{daemon.session_name},
+                );
+                daemon.running = false;
             }
         }
     }
@@ -714,6 +743,12 @@ pub const Daemon = struct {
     task_exit_code: ?u8 = null, // null = running or n/a, set when task completes
     task_ended_at: ?u64 = null, // timestamp when task exited
     pty_fd: i32 = -1, // set by daemonLoop so handleRun can probe the foreground process
+    /// What the child's wait status said, once it has been reaped. The
+    /// teardown must not reap again, and clients are told this exactly.
+    child_status: ?ipc.Exit = null,
+    /// Why the session is ending. A kill request sets it before the child
+    /// dies, so the exit the client receives says who caused it.
+    exit_reason: ipc.Exit.Reason = .natural,
     shell: []const u8 = "/bin/sh",
 
     /// Create a Daemon. Caller is responsible for freeing all variables passed
@@ -944,10 +979,18 @@ pub const Daemon = struct {
             dir.deleteFile(new_io, sesh_name) catch |err| {
                 std.log.warn("failed to delete socket file err={s}", .{@errorName(err)});
             };
-            self.handleKill(gpa, new_io);
-            self.deinit(gpa);
-            lib_posix.close(pty_info.master_fd);
-            _ = lib_posix.waitpid(self.pid, 0);
+            // A child that already ended has been reaped and reported; only
+            // one that outlived the loop still needs signalling.
+            if (self.child_status == null) {
+                self.handleKill(gpa, new_io);
+                self.deinit(gpa);
+                lib_posix.close(pty_info.master_fd);
+                _ = lib_posix.waitpid(self.pid, 0);
+            } else {
+                self.shutdown(gpa);
+                self.deinit(gpa);
+                lib_posix.close(pty_info.master_fd);
+            }
         }
 
         try daemonLoop(self, gpa, new_io, server_sock_fd, pty_info.master_fd);
@@ -1119,15 +1162,29 @@ pub const Daemon = struct {
         // restore, the output held since Hello goes out so none is lost.
         var restore_sent = false;
         defer if (client.phase == .negotiated) {
+            // Ready closes the boundary RestoreBegin opened: everything
+            // between the two is restored state, everything after is live.
+            ipc.appendMessage(gpa, &client.write_buf, .Ready, "") catch |err| {
+                std.log.warn("failed to buffer ready for client err={s}", .{@errorName(err)});
+            };
             client.phase = .ready;
+            client.has_pending_output = true;
             if (!restore_sent and !client.preready_overflow and client.preready_buf.items.len > 0) {
                 ipc.appendMessage(gpa, &client.write_buf, .Output, client.preready_buf.items) catch |err| {
                     std.log.warn("failed to flush held output for client err={s}", .{@errorName(err)});
                 };
-                client.has_pending_output = true;
             }
             client.preready_buf.clearAndFree(gpa);
         };
+        // Opened before anything is serialized, so a client resets its screen
+        // before the first restored byte lands on it -- which is what makes
+        // restoring into a screen that already has content safe.
+        if (client.phase == .negotiated) {
+            ipc.appendMessage(gpa, &client.write_buf, .RestoreBegin, "") catch |err| {
+                std.log.warn("failed to buffer restore boundary for client err={s}", .{@errorName(err)});
+            };
+            client.has_pending_output = true;
+        }
         const size = ipc.decodeResize(payload) catch |err| {
             std.log.warn(
                 "malformed Init session={s} fd={d} len={d} err={s}",
@@ -1154,9 +1211,17 @@ pub const Daemon = struct {
             try resizeTerm(gpa, term, resize.cols, resize.rows);
         }
 
-        // Only serialize on re-attach (has_had_client), not first attach, to avoid
-        // interfering with shell initialization (DA1 queries, etc.)
-        if (self.has_pty_output and self.has_had_client) {
+        // A client that has not negotiated is restored only on re-attach, as
+        // it always was: it has no way to be told a restore is coming, and
+        // replaying shell-initialization state into a fresh terminal is what
+        // that rule avoids. A negotiated client is restored on a first attach
+        // too -- it reset at RestoreBegin, so there is nothing to corrupt --
+        // and without that, output the child wrote before anyone attached is
+        // lost outright, which is exactly what happens in release builds where
+        // the daemon reaches the child before the first client connects.
+        const restore_wanted = self.has_pty_output and
+            (client.phase == .negotiated or self.has_had_client);
+        if (restore_wanted) {
             const cursor = &term.screens.active.cursor;
             std.log.debug(
                 "cursor before serialize: x={d} y={d} pending_wrap={}",
@@ -1169,14 +1234,22 @@ pub const Daemon = struct {
                 const restore_data = util.rewritePromptRedraw(gpa, term_output) orelse term_output;
                 defer gpa.free(term_output);
                 defer if (restore_data.ptr != term_output.ptr) gpa.free(restore_data);
-                ipc.appendMessage(gpa, &client.write_buf, .Output, restore_data) catch |err| {
-                    std.log.warn(
-                        "failed to buffer terminal state for client err={s}",
-                        .{@errorName(err)},
-                    );
-                };
+                // Sent as however many frames it takes rather than one: a
+                // long scrollback must not be capped by the frame size.
+                var offset: usize = 0;
+                while (offset < restore_data.len) {
+                    const end = @min(offset + RESTORE_CHUNK, restore_data.len);
+                    ipc.appendMessage(gpa, &client.write_buf, .Output, restore_data[offset..end]) catch |err| {
+                        std.log.warn(
+                            "failed to buffer terminal state for client err={s}",
+                            .{@errorName(err)},
+                        );
+                        break;
+                    };
+                    offset = end;
+                }
                 client.has_pending_output = true;
-                restore_sent = true;
+                restore_sent = offset == restore_data.len and restore_data.len > 0;
             }
         }
 
@@ -1223,6 +1296,38 @@ pub const Daemon = struct {
         _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
         try resizeTerm(gpa, term, resize.cols, resize.rows);
         std.log.debug("resize rows={d} cols={d}", .{ resize.rows, resize.cols });
+    }
+
+    /// Largest restore chunk. The snapshot goes out as however many Output
+    /// frames it takes, so scrollback is not capped by the frame size.
+    const RESTORE_CHUNK = 1024 * 1024;
+
+    /// Reap the child and tell every attached client how it ended.
+    ///
+    /// Ordering is the contract: this runs after the final PTY bytes have
+    /// been read and broadcast, so Exit is the last frame a client sees, and
+    /// the loop still gets an iteration to flush it before the socket closes.
+    /// Idempotent -- the teardown calls it too, in case the loop left another
+    /// way.
+    pub fn finishSession(self: *Daemon, gpa: std.mem.Allocator) void {
+        if (self.child_status != null) return;
+        const waited = lib_posix.waitpid(self.pid, 0);
+        const status = ipc.exitFromWaitStatus(waited.status, self.exit_reason);
+        self.child_status = status;
+        std.log.info(
+            "child exited session={s} pid={d} code={d} signal={d} reason={s}",
+            .{ self.session_name, self.pid, status.code, status.signal, @tagName(status.reason) },
+        );
+        for (self.clients.items) |client| {
+            // Only a client that negotiated knows this frame; a legacy one
+            // learns what it always did, from the socket closing.
+            if (client.phase != .ready) continue;
+            ipc.appendMessage(gpa, &client.write_buf, .Exit, &ipc.encodeExit(status)) catch |err| {
+                std.log.warn("failed to buffer exit for client err={s}", .{@errorName(err)});
+                continue;
+            };
+            client.has_pending_output = true;
+        }
     }
 
     pub fn handleDetach(self: *Daemon, gpa: std.mem.Allocator, client: *Client, i: usize) void {

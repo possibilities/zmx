@@ -25,6 +25,9 @@ pub const Tag = enum(u8) {
     Send = 18,
     Hello = 19,
     Welcome = 20,
+    RestoreBegin = 21,
+    Ready = 22,
+    Exit = 23,
     // Upstream tags 19..22 overlap the published Companion v1 contract.
     // Keep that contract stable and assign new operations unused values.
     EnvGet = 26,
@@ -252,6 +255,58 @@ pub fn negotiate(hello: Hello) Welcome {
         .version = if (low <= high and low != 0) high else 0,
         .capabilities = hello.capabilities & 0,
     };
+}
+
+/// How a session's child ended, sent to attached clients before the daemon
+/// closes their sockets. `code` and `signal` are what `waitpid` reported --
+/// a signalled child has a non-zero `signal` and a `code` of 0 -- while
+/// `reason` says what brought it about. On the wire: code u8, signal u8,
+/// reason u8, then five reserved zero bytes.
+pub const Exit = struct {
+    code: u8 = 0,
+    signal: u8 = 0,
+    reason: Reason = .natural,
+
+    /// Kept as explicit integers: these cross the socket.
+    pub const Reason = enum(u8) {
+        /// The child ended on its own, by exiting or by a signal nobody here sent.
+        natural = 0,
+        /// Someone asked the daemon to end the session.
+        requested = 1,
+        /// The daemon could not continue and took the child with it.
+        daemon_failure = 2,
+        /// The child never started: exec failed.
+        exec_failure = 3,
+        _,
+    };
+};
+
+pub const exit_len = 8;
+
+pub fn encodeExit(status: Exit) [exit_len]u8 {
+    var out = [_]u8{0} ** exit_len;
+    out[0] = status.code;
+    out[1] = status.signal;
+    out[2] = @intFromEnum(status.reason);
+    return out;
+}
+
+pub fn decodeExit(bytes: []const u8) error{BadLength}!Exit {
+    if (bytes.len != exit_len) return error.BadLength;
+    return .{
+        .code = bytes[0],
+        .signal = bytes[1],
+        .reason = @enumFromInt(bytes[2]),
+    };
+}
+
+/// Split a POSIX wait status into what the wire carries.
+pub fn exitFromWaitStatus(status: u32, reason: Exit.Reason) Exit {
+    // The low 7 bits name a signal; a zero there means the child exited and
+    // the next 8 bits are its code.
+    const sig: u8 = @truncate(status & 0x7f);
+    if (sig != 0) return .{ .code = 0, .signal = sig, .reason = reason };
+    return .{ .code = @truncate((status >> 8) & 0xff), .signal = 0, .reason = reason };
 }
 
 pub const Info = extern struct {
@@ -609,15 +664,15 @@ test "oversized frame header is rejected before its payload arrives" {
 
 test "Tag wire values are frozen" {
     inline for (.{
-        .{ Tag.Input, 0 },     .{ Tag.Output, 1 },        .{ Tag.Resize, 2 },
-        .{ Tag.Detach, 3 },    .{ Tag.DetachAll, 4 },     .{ Tag.Kill, 5 },
-        .{ Tag.Info, 6 },      .{ Tag.Init, 7 },          .{ Tag.History, 8 },
-        .{ Tag.Run, 9 },       .{ Tag.Ack, 10 },          .{ Tag.Switch, 11 },
-        .{ Tag.Write, 12 },    .{ Tag.TaskComplete, 13 }, .{ Tag.LabelGet, 14 },
-        .{ Tag.LabelSet, 15 }, .{ Tag.LabelClear, 16 },   .{ Tag.LabelData, 17 },
-        .{ Tag.Send, 18 },     .{ Tag.Hello, 19 },        .{ Tag.Welcome, 20 },
-        .{ Tag.EnvGet, 26 },   .{ Tag.EnvSet, 27 },       .{ Tag.EnvData, 28 },
-        .{ Tag.Capture, 29 },
+        .{ Tag.Input, 0 },         .{ Tag.Output, 1 },        .{ Tag.Resize, 2 },
+        .{ Tag.Detach, 3 },        .{ Tag.DetachAll, 4 },     .{ Tag.Kill, 5 },
+        .{ Tag.Info, 6 },          .{ Tag.Init, 7 },          .{ Tag.History, 8 },
+        .{ Tag.Run, 9 },           .{ Tag.Ack, 10 },          .{ Tag.Switch, 11 },
+        .{ Tag.Write, 12 },        .{ Tag.TaskComplete, 13 }, .{ Tag.LabelGet, 14 },
+        .{ Tag.LabelSet, 15 },     .{ Tag.LabelClear, 16 },   .{ Tag.LabelData, 17 },
+        .{ Tag.Send, 18 },         .{ Tag.Hello, 19 },        .{ Tag.Welcome, 20 },
+        .{ Tag.RestoreBegin, 21 }, .{ Tag.Ready, 22 },        .{ Tag.Exit, 23 },
+        .{ Tag.EnvGet, 26 }, .{ Tag.EnvSet, 27 }, .{ Tag.EnvData, 28 }, .{ Tag.Capture, 29 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
 }
 
@@ -628,6 +683,38 @@ test "Capture wire bytes are explicit little endian" {
     try std.testing.expectEqual(@as(u8, 2), decoded.format);
     try std.testing.expectEqual(@as(u32, 0x12345678), decoded.rows);
     try std.testing.expectError(error.BadLength, decodeCapture(bytes[0..7]));
+}
+
+test "Exit wire bytes are frozen" {
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 7, 0, 0, 0, 0, 0, 0, 0 },
+        &encodeExit(.{ .code = 7 }),
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 0, 9, 1, 0, 0, 0, 0, 0 },
+        &encodeExit(.{ .signal = 9, .reason = .requested }),
+    );
+    const decoded = try decodeExit(&.{ 7, 0, 3, 0, 0, 0, 0, 0 });
+    try std.testing.expectEqual(@as(u8, 7), decoded.code);
+    try std.testing.expectEqual(Exit.Reason.exec_failure, decoded.reason);
+    // An unknown reason decodes rather than trapping: this enum comes off the wire.
+    const future = try decodeExit(&.{ 0, 0, 200, 0, 0, 0, 0, 0 });
+    try std.testing.expectEqual(@as(u8, 200), @intFromEnum(future.reason));
+    try std.testing.expectError(error.BadLength, decodeExit(&.{ 0, 0, 0 }));
+}
+
+test "wait status splits into code or signal" {
+    // Exited with 7: code in the high byte, no signal.
+    const exited = exitFromWaitStatus(7 << 8, .natural);
+    try std.testing.expectEqual(@as(u8, 7), exited.code);
+    try std.testing.expectEqual(@as(u8, 0), exited.signal);
+    // Killed by SIGKILL: signal in the low bits, code zero.
+    const killed = exitFromWaitStatus(9, .requested);
+    try std.testing.expectEqual(@as(u8, 0), killed.code);
+    try std.testing.expectEqual(@as(u8, 9), killed.signal);
+    try std.testing.expectEqual(Exit.Reason.requested, killed.reason);
 }
 
 test "Hello wire bytes are frozen" {
@@ -672,6 +759,7 @@ test "Welcome wire bytes are frozen" {
     try std.testing.expectEqual(@as(u16, 1), min_protocol_version);
     try std.testing.expectEqual(@as(usize, 64), max_client_name_len);
     try std.testing.expectEqual(@as(u32, 16 * 1024 * 1024), max_payload_len);
+    try std.testing.expectEqual(@as(usize, 8), exit_len);
 }
 
 test "negotiate picks the highest shared version or rejects" {
