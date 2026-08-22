@@ -689,6 +689,9 @@ fn openZ(file_path: [*:0]const u8, flags: O, perm: mode_t) OpenError!fd_t {
             .NAMETOOLONG => return error.NameTooLong,
             .NFILE => return error.SystemFdQuotaExceeded,
             .NODEV => return error.NoDevice,
+            // /dev/tty with no controlling terminal: a daemon, or a caller
+            // under a pipe. An expected answer, not a stack trace.
+            .NXIO => return error.NoDevice,
             .NOENT => return error.FileNotFound,
             .SRCH => return error.ProcessNotFound,
             .NOMEM => return error.SystemResources,

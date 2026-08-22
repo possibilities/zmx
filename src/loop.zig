@@ -806,6 +806,17 @@ pub const Daemon = struct {
     /// saying so every time.
     logged_unreaped: bool = false,
     shell: []const u8 = "/bin/sh",
+    /// Labels the daemon is born with, in `zmx set` form. Applied before the
+    /// loop accepts anyone, so no client can see the session unlabelled.
+    initial_labels: ?[]const u8 = null,
+    /// How long the creating process waits for the daemon's startup report.
+    startup_timeout_ms: u32 = default_startup_timeout_ms,
+    /// What the daemon reported, in the creating process, once `run` has
+    /// returned there. Null in the daemon and when nothing was created.
+    startup: ?daemonize.Startup = null,
+    startup_name_buf: [daemonize.Startup.max_len]u8 = undefined,
+
+    pub const default_startup_timeout_ms: u32 = 5000;
 
     /// Create a Daemon. Caller is responsible for freeing all variables passed
     /// into the init fn.
@@ -934,7 +945,52 @@ pub const Daemon = struct {
             return false;
         }
 
-        return self.run(io, dir, sesh_name);
+        const is_daemon = try self.run(io, dir, sesh_name);
+        if (is_daemon) return true;
+        try self.reportStartup(io);
+        return false;
+    }
+
+    /// The creator's side of the startup report, for the human CLI: says
+    /// the session was created, or why it was not. A timeout is a warning,
+    /// not a failure -- the session may still come up, and attaching to it
+    /// is what the caller asked for.
+    fn reportStartup(self: *Daemon, io: std.Io) !void {
+        const report = self.startup orelse return;
+        var out_buf: [2048]u8 = undefined;
+        switch (report) {
+            .ready => {
+                var w = std.Io.File.stdout().writer(io, &out_buf);
+                try w.interface.print("session \"{s}\" created\n", .{self.session_name});
+                try w.interface.flush();
+            },
+            .exec_failed => |name| {
+                var w = std.Io.File.stderr().writer(io, &out_buf);
+                try w.interface.print(
+                    "error: session \"{s}\": command failed to start: {s}\n",
+                    .{ self.session_name, name },
+                );
+                try w.interface.flush();
+                // The message is the whole story; an error return would
+                // add a return trace under it in a debug build.
+                std.process.exit(1);
+            },
+            .daemon_failed => {
+                var w = std.Io.File.stderr().writer(io, &out_buf);
+                try w.interface.print(
+                    "error: session \"{s}\": daemon exited before it was ready (see the log)\n",
+                    .{self.session_name},
+                );
+                try w.interface.flush();
+                std.process.exit(1);
+            },
+            .timeout => {
+                std.log.warn(
+                    "no startup report within {d}ms session={s}",
+                    .{ self.startup_timeout_ms, self.session_name },
+                );
+            },
+        }
     }
 
     fn run(self: *Daemon, io: std.Io, dir: std.Io.Dir, sesh_name: []const u8) !bool {
@@ -961,27 +1017,30 @@ pub const Daemon = struct {
             }
         }
 
-        const pty_info = daemonize.daemonize(
+        const outcome = daemonize.daemonize(
             sesh_name,
             cmd,
             &keep_fds_open,
+            self.startup_timeout_ms,
+            &self.startup_name_buf,
         ) catch |err| {
-            switch (err) {
-                error.IsClientProc => {
-                    // send a msg to the client that the session was created.
-                    var w_buf: [2048]u8 = undefined;
-                    var w = std.Io.File.stdout().writer(io, &w_buf);
-                    try w.interface.print("session \"{s}\" created\n", .{sesh_name});
-                    try w.interface.flush();
-                    lib_posix.close(server_sock_fd);
-                    return false;
-                },
-                else => {
-                    lib_posix.close(server_sock_fd);
-                    dir.deleteFile(io, self.session_name) catch {};
-                    return err;
-                },
-            }
+            // Only the daemon side fails here; the creator always gets a
+            // report. So this process owns the socket and must remove it.
+            lib_posix.close(server_sock_fd);
+            dir.deleteFile(io, self.session_name) catch {};
+            return err;
+        };
+        const pty_info = switch (outcome) {
+            .creator => |report| {
+                // The daemon owns the socket file from here on, whatever it
+                // reported: on a failed exec it runs the same teardown a
+                // finished session does, and on a timeout it may still be
+                // coming up. The creator removes nothing.
+                self.startup = report;
+                lib_posix.close(server_sock_fd);
+                return false;
+            },
+            .daemon => |info| info,
         };
         // =======
         // WARNING: cannot use upstream allocator or io after this point since
@@ -991,6 +1050,9 @@ pub const Daemon = struct {
         // =======
 
         self.pid = pty_info.pid;
+        // The child never ran: it has already exited, and the loop below
+        // finds its pty at EOF and reaps it. Clients are told exactly that.
+        if (pty_info.exec_err.len > 0) self.exit_reason = .exec_failure;
 
         var threaded: std.Io.Threaded = .init_single_threaded;
         defer threaded.deinit();
