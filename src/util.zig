@@ -19,6 +19,8 @@ pub const SessionEntry = struct {
     created_at: u64,
     task_ended_at: ?u64,
     task_exit_code: ?u8,
+    /// The daemon's protocol range, when it answered a Hello.
+    protocol: ?ipc.Welcome = null,
 
     pub fn deinit(self: SessionEntry, alloc: std.mem.Allocator) void {
         alloc.free(self.name);
@@ -32,10 +34,19 @@ pub const SessionEntry = struct {
     }
 };
 
+pub const EnumerateOptions = struct {
+    /// Delete the socket of a daemon that refused the connection. Right for
+    /// the interactive `list`, which is where people expect dead sessions
+    /// to be swept up; wrong for anything that is reporting state to a
+    /// program, which must not destroy the evidence it reports.
+    cleanup_stale: bool,
+};
+
 pub fn get_session_entries(
     alloc: std.mem.Allocator,
     io: std.Io,
     socket_dir: []const u8,
+    options: EnumerateOptions,
 ) !std.ArrayList(SessionEntry) {
     var dir = try std.Io.Dir.openDirAbsolute(io, socket_dir, .{ .iterate = true });
     defer dir.close(io);
@@ -70,7 +81,7 @@ pub fn get_session_entries(
                 // Only clean up when the daemon is definitively gone. A busy
                 // daemon can miss the probe timeout; deleting its socket
                 // orphans it permanently.
-                if (err == error.ConnectionRefused) {
+                if (options.cleanup_stale and err == error.ConnectionRefused) {
                     socket.cleanupStaleSocket(io, dir, entry.name);
                 }
                 continue;
@@ -108,6 +119,7 @@ pub fn get_session_entries(
                 .created_at = result.info.created_at,
                 .task_ended_at = result.info.task_ended_at,
                 .task_exit_code = result.info.task_exit_code,
+                .protocol = result.protocol,
             });
         }
     }

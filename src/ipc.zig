@@ -485,6 +485,9 @@ const SessionProbeResult = struct {
     fd: i32,
     info: Info,
     labels: ?[]const u8,
+    /// What the daemon answered to a Hello spanning every version this
+    /// build speaks; null from a daemon that predates negotiation.
+    protocol: ?Welcome,
     alloc: std.mem.Allocator,
 
     pub fn deinit(self: *const SessionProbeResult) void {
@@ -503,6 +506,18 @@ pub fn probeSession(
 
     send(fd, .Info, "") catch return error.Unexpected;
     send(fd, .LabelGet, "") catch {};
+    // Last, so a daemon that did not know the tag has already answered the
+    // two it did. (A daemon ignores a tag it does not know; this only
+    // orders the replies.) The range is everything this build speaks, so
+    // the Welcome says what the daemon does, not whether we overlap.
+    var hello_buf: [max_hello_len]u8 = undefined;
+    if (encodeHello(&hello_buf, .{
+        .min_version = min_protocol_version,
+        .max_version = protocol_version,
+        .client = "probe",
+    })) |hello| {
+        send(fd, .Hello, hello) catch {};
+    } else |_| {}
 
     var poll_fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
     const poll_result = lib_posix.poll(&poll_fds, timeout_ms) catch return error.Unexpected;
@@ -518,6 +533,7 @@ pub fn probeSession(
 
     var info_result: ?Info = null;
     var labels: ?[]const u8 = null;
+    var protocol: ?Welcome = null;
     errdefer if (labels) |lbl| alloc.free(lbl);
 
     while (true) {
@@ -529,8 +545,11 @@ pub fn probeSession(
             if (msg.header.tag == .LabelData) {
                 labels = alloc.dupe(u8, msg.payload) catch null;
             }
+            if (msg.header.tag == .Welcome) {
+                protocol = decodeWelcome(msg.payload) catch null;
+            }
 
-            if (info_result != null and labels != null) break;
+            if (info_result != null and labels != null and protocol != null) break;
             continue;
         }
 
@@ -546,6 +565,7 @@ pub fn probeSession(
             .fd = fd,
             .info = info,
             .labels = labels,
+            .protocol = protocol,
             .alloc = alloc,
         };
     }

@@ -9,4 +9,5 @@ comptime {
     _ = @import("cfg.zig");
     _ = @import("daemonize.zig");
     _ = @import("create.zig");
+    _ = @import("discover.zig");
 }

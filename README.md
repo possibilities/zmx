@@ -107,7 +107,8 @@ Commands:
   [p]rint <name> <text...>                                 Inject text into session display
   [wr]ite <name> <file_path>                               Write stdin to file_path through the session
   [d]etach                                                 Detach all clients (ctrl+\\ for current client)
-  [l]ist|ls [--short]                                      List active sessions
+  [l]ist|ls [--short|--json|--where k=v]   List active sessions
+  [i]nspect <name> [--json] [--where k=v]  Report one session, or that it is absent
   [g]et <name>                                             Get session labels
   set <name> k=v ...                                       Set session labels
   [cl]ear <name>                                           Clear all session labels

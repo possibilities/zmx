@@ -14,6 +14,7 @@ const signal = @import("signal.zig");
 const Cfg = @import("cfg.zig");
 const loop = @import("loop.zig");
 const create = @import("create.zig");
+const discover = @import("discover.zig");
 const Client = loop.Client;
 const Daemon = loop.Daemon;
 const version = build_options.version;
@@ -70,12 +71,31 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "h") or std.mem.eql(u8, cmd, "-h")) {
         return help(io);
     } else if (std.mem.eql(u8, cmd, "list") or std.mem.eql(u8, cmd, "l") or std.mem.eql(u8, cmd, "ls")) {
-        var short = false;
-        while (args.next()) |arg| {
-            if (detectHelp(arg)) return help(io);
-            if (std.mem.eql(u8, arg, "--short")) short = true;
+        var list_args: std.ArrayList([]const u8) = .empty;
+        defer list_args.deinit(gpa);
+        while (args.next()) |arg| try list_args.append(gpa, arg);
+        var parsed = try discover.parseArgs(gpa, list_args.items);
+        defer parsed.deinit(gpa);
+        if (parsed.want_help) return help(io);
+        if (parsed.usage_error) |msg| return usageError(io, msg);
+        // The interactive list sweeps dead sessions; the program-facing
+        // forms report what is there and touch nothing.
+        if (parsed.json or parsed.where.items.len > 0) {
+            return discover.list(gpa, io, &cfg, .{ .json = parsed.json, .where = parsed.where.items });
         }
-        return list(gpa, io, &cfg, short);
+        return list(gpa, io, &cfg, parsed.short);
+    } else if (std.mem.eql(u8, cmd, "inspect") or std.mem.eql(u8, cmd, "i")) {
+        var inspect_args: std.ArrayList([]const u8) = .empty;
+        defer inspect_args.deinit(gpa);
+        while (args.next()) |arg| try inspect_args.append(gpa, arg);
+        var parsed = try discover.parseArgs(gpa, inspect_args.items);
+        defer parsed.deinit(gpa);
+        if (parsed.want_help) return help(io);
+        if (parsed.usage_error) |msg| return usageError(io, msg);
+        if (parsed.name.len == 0) return error.SessionNameRequired;
+        const sesh = try socket.getSeshName(gpa, parsed.name);
+        defer gpa.free(sesh);
+        return discover.inspect(gpa, io, &cfg, sesh, .{ .json = parsed.json, .where = parsed.where.items });
     } else if (std.mem.eql(u8, cmd, "get") or std.mem.eql(u8, cmd, "g")) {
         const sesh_name = args.next() orelse {
             return printError(io, "session name required (or run inside a zmx session)", .{});
@@ -199,7 +219,7 @@ pub fn main(init: std.process.Init) !void {
         defer gpa.free(env_str);
 
         return attach(gpa, io, &daemon, env_str, parsed.labels);
-    } else if (std.mem.eql(u8, cmd, "create") or std.mem.eql(u8, cmd, "c")) {
+    } else if (std.mem.eql(u8, cmd, "create")) {
         var create_args: std.ArrayList([]const u8) = .empty;
         defer create_args.deinit(gpa);
         while (args.next()) |arg| {
@@ -344,7 +364,7 @@ pub fn main(init: std.process.Init) !void {
         if (matchers.items.len == 0) {
             return printError(io, "session name required", .{});
         }
-        var sessions = try util.get_session_entries(gpa, io, cfg.socket_dir);
+        var sessions = try util.get_session_entries(gpa, io, cfg.socket_dir, .{ .cleanup_stale = true });
         defer {
             for (sessions.items) |session| {
                 session.deinit(gpa);
@@ -438,7 +458,7 @@ pub fn main(init: std.process.Init) !void {
         }
 
         if (any_prefix) {
-            var sessions = try util.get_session_entries(gpa, io, cfg.socket_dir);
+            var sessions = try util.get_session_entries(gpa, io, cfg.socket_dir, .{ .cleanup_stale = true });
             defer {
                 for (sessions.items) |session| {
                     session.deinit(gpa);
@@ -553,12 +573,15 @@ fn help(io: std.Io) !void {
         \\
         \\Commands:
         \\  [a]ttach [--labels kv] <name> [command...]                 Attach to session, creating if needed
+        \\  create [--labels kv] [--json] <name> [--] <command...>
+        \\                                           Create a session without attaching
         \\  [r]un <name> [-d] [command...]                             Send command without attaching
         \\  [s]end <name> <text...>                                    Send raw input to session PTY
         \\  [p]rint <name> <text...>                                   Inject text into session display
         \\  [wr]ite <name> <file_path>                                 Write stdin to file_path through the session
         \\  [d]etach                                                   Detach all clients (ctrl+\\ for current client)
-        \\  [l]ist|ls [--short]                                        List active sessions
+        \\  [l]ist|ls [--short|--json|--where k=v]   List active sessions
+        \\  [i]nspect <name> [--json] [--where k=v]  Report one session, or that it is absent
         \\  [g]et <name>                                               Get session labels
         \\  set <name> k=v ...                                         Set session labels (k= to remove)
         \\  [cl]ear <name>                                             Clear all session labels
@@ -574,6 +597,24 @@ fn help(io: std.Io) !void {
         \\Attach:
         \\  This will spawn a login $SHELL with a PTY.  You can provide a
         \\  command instead of creating a shell.
+        \\
+        \\Create:
+        \\  For programs that own sessions. Unlike attach it never attaches to
+        \\  an existing session (AlreadyExists), passes the command straight to
+        \\  exec, applies --labels before the session can be seen, and returns
+        \\  only once the command is running -- or reports why it is not:
+        \\  ExecFailed (with the cause), DaemonFailed, Timeout. --json prints one
+        \\  object with ok, name, socketPath, pid, createdAt, or ok:false with
+        \\  error and message. --timeout-ms bounds the wait (default 5000).
+        \\
+        \\    zmx create --json --labels "owner=me" build -- make -j8
+        \\
+        \\Discovery:
+        \\  list --json and inspect report sessions without changing anything: a
+        \\  refused socket is reported as state "refused", never deleted (the
+        \\  plain list cleans those up). States: live, refused, unreachable,
+        \\  absent. --where k=v keeps sessions whose labels match (repeatable,
+        \\  all must hold); sessions whose labels cannot be read never match.
         \\
         \\  --labels applies labels as the session is created, in the same form
         \\  `zmx set` takes. A caller that creates and then labels in two steps
@@ -909,7 +950,7 @@ fn wait(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, matchers: std.ArrayList
     var prev_done: i32 = 0;
     while (true) {
         agg_exit_code = 0;
-        var sessions = try util.get_session_entries(alloc, io, cfg.socket_dir);
+        var sessions = try util.get_session_entries(alloc, io, cfg.socket_dir, .{ .cleanup_stale = true });
         var total: i32 = 0;
         var done: i32 = 0;
 
@@ -1018,7 +1059,7 @@ fn wait(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, matchers: std.ArrayList
     }
     try stdout.flush();
 
-    const sessions = try util.get_session_entries(alloc, io, cfg.socket_dir);
+    const sessions = try util.get_session_entries(alloc, io, cfg.socket_dir, .{ .cleanup_stale = true });
     for (sessions.items) |session| {
         var found = false;
         for (matchers.items) |m| {
@@ -1071,11 +1112,19 @@ fn wait(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, matchers: std.ArrayList
     std.process.exit(agg_exit_code);
 }
 
+fn usageError(io: std.Io, msg: []const u8) void {
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.File.stderr().writerStreaming(io, &buf);
+    w.interface.print("error: {s}\n", .{msg}) catch {};
+    w.interface.flush() catch {};
+    std.process.exit(1);
+}
+
 fn list(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, short: bool) !void {
     const current_session = socket.getSeshNameFromEnv();
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
-    var sessions = try util.get_session_entries(alloc, io, cfg.socket_dir);
+    var sessions = try util.get_session_entries(alloc, io, cfg.socket_dir, .{ .cleanup_stale = true });
     defer {
         for (sessions.items) |session| {
             session.deinit(alloc);
