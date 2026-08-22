@@ -13,6 +13,7 @@ const lib_posix = @import("posix.zig");
 const signal = @import("signal.zig");
 const Cfg = @import("cfg.zig");
 const loop = @import("loop.zig");
+const create = @import("create.zig");
 const Client = loop.Client;
 const Daemon = loop.Daemon;
 const version = build_options.version;
@@ -198,6 +199,40 @@ pub fn main(init: std.process.Init) !void {
         defer gpa.free(env_str);
 
         return attach(gpa, io, &daemon, env_str, parsed.labels);
+    } else if (std.mem.eql(u8, cmd, "create") or std.mem.eql(u8, cmd, "c")) {
+        var create_args: std.ArrayList([]const u8) = .empty;
+        defer create_args.deinit(gpa);
+        while (args.next()) |arg| {
+            try create_args.append(gpa, arg);
+        }
+
+        const parsed = create.parseArgs(create_args.items);
+        if (parsed.want_help) {
+            return help(io);
+        }
+        if (parsed.usage_error) |msg| {
+            var buf: [4096]u8 = undefined;
+            var w = std.Io.File.stderr().writer(io, &buf);
+            w.interface.print("error: {s}\n", .{msg}) catch {};
+            w.interface.flush() catch {};
+            std.process.exit(1);
+        }
+
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd_len = std.process.currentPath(io, &cwd_buf) catch 0;
+        const cwd = cwd_buf[0..cwd_len];
+
+        const status = try create.create(gpa, io, &cfg, .{
+            .name = parsed.name,
+            .command = create_args.items[parsed.command_start..],
+            .labels = parsed.labels,
+            .json = parsed.json,
+            .timeout_ms = parsed.timeout_ms,
+            .cwd = cwd,
+            .shell = shell_env,
+        });
+        if (status != 0) std.process.exit(status);
+        return;
     } else if (std.mem.eql(u8, cmd, "run") or std.mem.eql(u8, cmd, "r")) {
         const session_name = args.next() orelse "";
         if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {

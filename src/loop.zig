@@ -951,6 +951,38 @@ pub const Daemon = struct {
         return false;
     }
 
+    pub const CreateError = error{
+        /// A live daemon answers on that name. Create-only never attaches.
+        AlreadyExists,
+        /// The socket exists but the connect failed for a reason other than
+        /// refusal, so whether a daemon is behind it is unknown. Not a
+        /// state to create over.
+        SessionUnreachable,
+    };
+
+    /// Create-only counterpart of `ensureSession`: a name that already has
+    /// a live session is an error, never something to attach to, and the
+    /// supplied command is never silently dropped. A refused socket is a
+    /// dead session and is replaced. The startup report is left in
+    /// `startup` for the caller to act on; nothing is printed here.
+    pub fn createSession(self: *Daemon, io: std.Io) !bool {
+        std.log.info("create session session={s}", .{self.session_name});
+        var dir = try std.Io.Dir.openDirAbsolute(io, self.cfg.socket_dir, .{});
+        defer dir.close(io);
+
+        if (try socket.sessionExists(io, dir, self.session_name)) {
+            if (ipc.connectSession(self.socket_path)) |fd| {
+                lib_posix.close(fd);
+                return error.AlreadyExists;
+            } else |err| switch (err) {
+                error.ConnectionRefused => socket.cleanupStaleSocket(io, dir, self.session_name),
+                else => return error.SessionUnreachable,
+            }
+        }
+
+        return self.run(io, dir, self.session_name);
+    }
+
     /// The creator's side of the startup report, for the human CLI: says
     /// the session was created, or why it was not. A timeout is a warning,
     /// not a failure -- the session may still come up, and attaching to it
@@ -1086,6 +1118,11 @@ pub const Daemon = struct {
             }
             break :blk std.heap.c_allocator;
         };
+
+        // Born labelled: applied with the daemon's own allocator, before the
+        // loop accepts a client, so there is no window in which the session
+        // exists without them.
+        if (self.initial_labels) |kvs| try self.applyLabels(gpa, kvs);
 
         defer {
             // Close and unlink the listen socket BEFORE handleKill()'s
@@ -1792,7 +1829,15 @@ pub const Daemon = struct {
 
     fn handleLabelSet(self: *Daemon, gpa: std.mem.Allocator, client: *Client, labels: []const u8) !void {
         std.log.info("handle label set payload={s}", .{labels});
+        try self.applyLabels(gpa, labels);
+        try ipc.appendMessage(gpa, &client.write_buf, .Ack, "");
+        client.has_pending_output = true;
+    }
 
+    /// Merges `k=v ...` into the session's labels; an empty value removes
+    /// the key. Validation is the caller's job -- the CLI rejects a bad
+    /// label before a session exists to carry it.
+    fn applyLabels(self: *Daemon, gpa: std.mem.Allocator, labels: []const u8) !void {
         var kvs = label.LabelIterator.init(labels);
         while (kvs.next()) |kv| {
             if (kv.value.len == 0) {
@@ -1815,9 +1860,6 @@ pub const Daemon = struct {
                 gpa.free(existing.value);
             }
         }
-
-        try ipc.appendMessage(gpa, &client.write_buf, .Ack, "");
-        client.has_pending_output = true;
     }
 
     fn handleLabelClear(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
