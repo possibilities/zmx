@@ -41,13 +41,15 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8) !ClientResult {
     var sock_write_buf = try std.ArrayList(u8).initCapacity(gpa, 4096);
     defer sock_write_buf.deinit(gpa);
 
-    if (env_str.len > 0) {
-        try ipc.appendMessage(gpa, &sock_write_buf, .EnvSet, env_str);
-    }
-
-    // Send init message with terminal size (buffered)
-    const size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
-    try ipc.appendSizeMessage(gpa, &sock_write_buf, .Init, size);
+    // Negotiate first; Init (with the terminal size) goes out once the
+    // daemon's Welcome says which version it speaks.
+    var hello_buf: [ipc.max_hello_len]u8 = undefined;
+    const hello = try ipc.encodeHello(&hello_buf, .{
+        .min_version = ipc.min_protocol_version,
+        .max_version = ipc.protocol_version,
+        .client = "zmx",
+    });
+    try ipc.appendMessage(gpa, &sock_write_buf, .Hello, hello);
 
     var poll_fds = try std.ArrayList(lib_posix.pollfd).initCapacity(gpa, 4);
     defer poll_fds.deinit(gpa);
@@ -104,7 +106,7 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8) !ClientResult {
         if (poll_fds.items[2].revents & lib_posix.POLL.IN != 0) {
             signal.drainSignalPipe();
             const next_size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
-            try ipc.appendSizeMessage(gpa, &sock_write_buf, .Resize, next_size);
+            try ipc.appendMessage(gpa, &sock_write_buf, .Resize, &ipc.encodeResize(next_size));
         }
 
         // Handle stdin -> socket (Input)
@@ -151,6 +153,22 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8) !ClientResult {
 
             while (read_buf.next()) |msg| {
                 switch (msg.header.tag) {
+                    .Welcome => {
+                        const welcome = ipc.decodeWelcome(msg.payload) catch |err| {
+                            std.log.err("malformed Welcome err={s}", .{@errorName(err)});
+                            return error.ProtocolMismatch;
+                        };
+                        if (!welcome.accepted()) {
+                            std.log.err(
+                                "daemon speaks protocol {d}..{d}, this client speaks {d}..{d}",
+                                .{ welcome.min_version, welcome.max_version, ipc.min_protocol_version, ipc.protocol_version },
+                            );
+                            return error.ProtocolMismatch;
+                        }
+                        const size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
+                        if (env_str.len > 0) try ipc.appendMessage(gpa, &sock_write_buf, .EnvSet, env_str);
+                        try ipc.appendMessage(gpa, &sock_write_buf, .Init, &ipc.encodeResize(size));
+                    },
                     .Output => {
                         if (msg.payload.len > 0) {
                             try stdout_buf.appendSlice(gpa, msg.payload);
@@ -160,7 +178,7 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8) !ClientResult {
                         // daemon is asking for the client's window size usually in response
                         // to this client being set as leader.
                         const next_size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
-                        try ipc.appendSizeMessage(gpa, &sock_write_buf, .Resize, next_size);
+                        try ipc.appendMessage(gpa, &sock_write_buf, .Resize, &ipc.encodeResize(next_size));
                     },
                     .Switch => {
                         std.log.info("switch session", .{});
@@ -402,6 +420,11 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     const broadcast_data = util.rewritePromptRedraw(gpa, buf[0..n]) orelse buf[0..n];
                     defer if (broadcast_data.ptr != buf[0..n].ptr) gpa.free(broadcast_data);
                     for (daemon.clients.items) |client| {
+                        if (client.phase == .negotiated) {
+                            client.holdOutput(broadcast_data);
+                            continue;
+                        }
+                        if (!client.receivesLiveOutput()) continue;
                         ipc.appendMessage(gpa, &client.write_buf, .Output, broadcast_data) catch |err| {
                             std.log.warn(
                                 "failed to buffer output for client err={s}",
@@ -492,8 +515,13 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         .History => try daemon.handleHistory(gpa, client, &term, msg.payload),
                         .Capture => try daemon.handleCapture(gpa, client, &term, msg.payload),
                         .Run => try daemon.handleRun(gpa, io, client, msg.payload),
-                        .Ack, .TaskComplete, .LabelData, .EnvData => {},
+                        .Ack, .TaskComplete, .LabelData, .EnvData, .Welcome => {},
                         .Write => try daemon.handleWrite(gpa, client, msg.payload),
+                        .Hello => {
+                            try daemon.handleHello(gpa, client, msg.payload);
+                            // Nothing after a rejected Hello is read.
+                            if (client.phase == .rejected) break;
+                        },
                         _ => std.log.warn(
                             "ignoring unknown IPC tag={d}",
                             .{@intFromEnum(msg.header.tag)},
@@ -518,6 +546,11 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
 
                 if (client.write_buf.items.len == 0) {
                     client.has_pending_output = false;
+                    if (client.phase == .rejected) {
+                        const last = daemon.closeClient(gpa, client, i, false);
+                        if (last) break :daemon_loop;
+                        continue;
+                    }
                 }
             }
 
@@ -549,17 +582,62 @@ pub const Client = struct {
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
     env_str: ?[]u8 = null,
+    phase: Phase = .connected,
+    /// Live PTY output that arrived while `negotiated`, held back so the
+    /// restore sent by Init is the first output the client sees. If Init
+    /// sends no restore (a first attach), this is flushed instead, so a
+    /// negotiating client misses nothing. Bounded by `preready_max`; past
+    /// that the held bytes are dropped, since the shadow terminal has them
+    /// and a restore will.
+    preready_buf: std.ArrayList(u8) = .empty,
+    preready_overflow: bool = false,
+
+    pub const preready_max = 1024 * 1024;
+
+    /// Where a client is in the versioned contract. A client that never
+    /// sends Hello stays `connected` and gets pre-negotiation behavior,
+    /// which is what every one-shot command client and older attach does.
+    /// A client that sends Hello is `negotiated` until its Init has been
+    /// handled, then `ready`; live PTY output is withheld in between so the
+    /// restore sent by Init is the first output it sees. A Hello the daemon
+    /// cannot satisfy moves the client to `rejected`: the Welcome saying so
+    /// is flushed, then the connection is closed.
+    pub const Phase = enum { connected, negotiated, ready, rejected };
+
+    /// Whether live PTY output is broadcast to this client now.
+    pub fn receivesLiveOutput(self: *const Client) bool {
+        return switch (self.phase) {
+            .connected, .ready => true,
+            .negotiated, .rejected => false,
+        };
+    }
 
     pub fn deinit(self: *Client, gpa: std.mem.Allocator) void {
         lib_posix.close(self.socket_fd);
         self.read_buf.deinit();
         self.write_buf.deinit(self.alloc);
-        if (self.env_str) |s| gpa.free(s);
+        if (self.env_str) |value| gpa.free(value);
+        self.preready_buf.deinit(self.alloc);
+    }
+
+    /// Hold live output for a client that has negotiated but not attached.
+    pub fn holdOutput(self: *Client, data: []const u8) void {
+        if (self.preready_overflow) return;
+        if (self.preready_buf.items.len + data.len > preready_max) {
+            self.preready_overflow = true;
+            self.preready_buf.clearAndFree(self.alloc);
+            return;
+        }
+        self.preready_buf.appendSlice(self.alloc, data) catch {
+            self.preready_overflow = true;
+            self.preready_buf.clearAndFree(self.alloc);
+        };
     }
 
     fn setEnv(self: *Client, gpa: std.mem.Allocator, env_str: []const u8) !void {
-        if (self.env_str) |s| gpa.free(s);
-        self.env_str = if (env_str.len > 0) try gpa.dupe(u8, env_str) else null;
+        const replacement = if (env_str.len > 0) try gpa.dupe(u8, env_str) else null;
+        if (self.env_str) |value| gpa.free(value);
+        self.env_str = replacement;
     }
 };
 
@@ -947,6 +1025,37 @@ pub const Daemon = struct {
         }
     }
 
+    /// Answer a client's Hello. The Welcome is buffered ahead of anything
+    /// else so the client reads it before any output; a client the daemon
+    /// cannot serve is told so and then closed once that Welcome is flushed.
+    pub fn handleHello(self: *Daemon, gpa: std.mem.Allocator, client: *Client, payload: []const u8) !void {
+        const hello = ipc.decodeHello(payload) catch |err| {
+            std.log.warn(
+                "malformed Hello session={s} fd={d} err={s}",
+                .{ self.session_name, client.socket_fd, @errorName(err) },
+            );
+            client.phase = .rejected;
+            try ipc.appendMessage(gpa, &client.write_buf, .Welcome, &ipc.encodeWelcome(.{ .version = 0 }));
+            client.has_pending_output = true;
+            return;
+        };
+        if (client.phase != .connected) {
+            std.log.warn(
+                "repeated Hello ignored session={s} fd={d} client={s}",
+                .{ self.session_name, client.socket_fd, hello.client },
+            );
+            return;
+        }
+        const welcome = ipc.negotiate(hello);
+        client.phase = if (welcome.accepted()) .negotiated else .rejected;
+        std.log.info(
+            "hello session={s} fd={d} client={s} versions={d}..{d} -> {d}",
+            .{ self.session_name, client.socket_fd, hello.client, hello.min_version, hello.max_version, welcome.version },
+        );
+        try ipc.appendMessage(gpa, &client.write_buf, .Welcome, &ipc.encodeWelcome(welcome));
+        client.has_pending_output = true;
+    }
+
     pub fn handleInit(
         self: *Daemon,
         gpa: std.mem.Allocator,
@@ -956,6 +1065,20 @@ pub const Daemon = struct {
         payload: []const u8,
     ) !void {
         const size = ipc.decodeResize(payload) catch return;
+        // Whatever restore Init buffers below is the first output a
+        // negotiated client sees; live output resumes after it. With no
+        // restore, the output held since Hello goes out so none is lost.
+        var restore_sent = false;
+        defer if (client.phase == .negotiated) {
+            client.phase = .ready;
+            if (!restore_sent and !client.preready_overflow and client.preready_buf.items.len > 0) {
+                ipc.appendMessage(gpa, &client.write_buf, .Output, client.preready_buf.items) catch |err| {
+                    std.log.warn("failed to flush held output for client err={s}", .{@errorName(err)});
+                };
+                client.has_pending_output = true;
+            }
+            client.preready_buf.clearAndFree(gpa);
+        };
 
         client.is_terminal = true;
 
@@ -997,6 +1120,7 @@ pub const Daemon = struct {
                     );
                 };
                 client.has_pending_output = true;
+                restore_sent = true;
             }
         }
 

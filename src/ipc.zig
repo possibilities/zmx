@@ -23,12 +23,16 @@ pub const Tag = enum(u8) {
     LabelClear = 16,
     LabelData = 17,
     Send = 18,
-    EnvGet = 19,
-    EnvSet = 20,
-    EnvData = 21,
+    Hello = 19,
+    Welcome = 20,
+    // Upstream tags 19..22 overlap the published Companion v1 contract.
+    // Keep that contract stable and assign new operations unused values.
+    EnvGet = 26,
+    EnvSet = 27,
+    EnvData = 28,
     /// Scoped history: the active screen plus a bounded number of
     /// preceding scrollback rows. Request payload is `Capture`.
-    Capture = 22,
+    Capture = 29,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
     // @enumFromInt, so out-of-range values are representable
     // rather than UB. Switches must handle `_` (unknown tag).
@@ -160,6 +164,96 @@ pub const MAX_CWD_LEN = 256;
 /// Frozen wire shape. Do NOT add fields! New stats go in new `Tag` values
 /// so old daemons (whose `_` arm ignores unknown tags) stay reachable.
 /// Changing `@sizeOf(Info)` breaks `zmx list` against running daemons.
+/// Version of the negotiated client contract: the frame envelope above plus
+/// Hello/Welcome and the attached-client lifecycle. Bump when a client that
+/// speaks only the previous version could misread the daemon.
+pub const protocol_version: u16 = 1;
+pub const min_protocol_version: u16 = 1;
+
+/// First message from a client that wants the versioned contract. A client
+/// that never sends one is a legacy client and gets pre-negotiation
+/// behavior. On the wire: min_version u16, max_version u16, capabilities
+/// u32 (all little-endian), then the client name as UTF-8, at most
+/// `max_client_name_len` bytes.
+pub const Hello = struct {
+    min_version: u16,
+    max_version: u16,
+    capabilities: u32 = 0,
+    client: []const u8,
+};
+
+pub const hello_fixed_len = 8;
+pub const max_client_name_len = 64;
+pub const max_hello_len = hello_fixed_len + max_client_name_len;
+
+pub fn encodeHello(buf: *[max_hello_len]u8, hello: Hello) error{NameTooLong}![]const u8 {
+    if (hello.client.len > max_client_name_len) return error.NameTooLong;
+    std.mem.writeInt(u16, buf[0..2], hello.min_version, .little);
+    std.mem.writeInt(u16, buf[2..4], hello.max_version, .little);
+    std.mem.writeInt(u32, buf[4..8], hello.capabilities, .little);
+    @memcpy(buf[hello_fixed_len..][0..hello.client.len], hello.client);
+    return buf[0 .. hello_fixed_len + hello.client.len];
+}
+
+pub fn decodeHello(bytes: []const u8) error{ BadLength, NameTooLong }!Hello {
+    if (bytes.len < hello_fixed_len) return error.BadLength;
+    if (bytes.len > max_hello_len) return error.NameTooLong;
+    return .{
+        .min_version = std.mem.readInt(u16, bytes[0..2], .little),
+        .max_version = std.mem.readInt(u16, bytes[2..4], .little),
+        .capabilities = std.mem.readInt(u32, bytes[4..8], .little),
+        .client = bytes[hello_fixed_len..],
+    };
+}
+
+/// The daemon's answer to Hello. `version` is the one both sides will
+/// speak, or 0 when the ranges do not overlap, in which case the daemon
+/// closes the connection after sending it; `min_version`/`max_version` are
+/// what the daemon speaks so the client can say why. On the wire: version
+/// u16, min_version u16, max_version u16, capabilities u32, little-endian.
+pub const Welcome = struct {
+    version: u16,
+    min_version: u16 = min_protocol_version,
+    max_version: u16 = protocol_version,
+    capabilities: u32 = 0,
+
+    pub fn accepted(self: Welcome) bool {
+        return self.version != 0;
+    }
+};
+
+pub const welcome_len = 10;
+
+pub fn encodeWelcome(welcome: Welcome) [welcome_len]u8 {
+    var out: [welcome_len]u8 = undefined;
+    std.mem.writeInt(u16, out[0..2], welcome.version, .little);
+    std.mem.writeInt(u16, out[2..4], welcome.min_version, .little);
+    std.mem.writeInt(u16, out[4..6], welcome.max_version, .little);
+    std.mem.writeInt(u32, out[6..10], welcome.capabilities, .little);
+    return out;
+}
+
+pub fn decodeWelcome(bytes: []const u8) error{BadLength}!Welcome {
+    if (bytes.len != welcome_len) return error.BadLength;
+    return .{
+        .version = std.mem.readInt(u16, bytes[0..2], .little),
+        .min_version = std.mem.readInt(u16, bytes[2..4], .little),
+        .max_version = std.mem.readInt(u16, bytes[4..6], .little),
+        .capabilities = std.mem.readInt(u32, bytes[6..10], .little),
+    };
+}
+
+/// Pick the highest version both sides speak; `version` is 0 when there is
+/// none. Capabilities are the intersection (none are defined yet).
+pub fn negotiate(hello: Hello) Welcome {
+    const low = @max(hello.min_version, min_protocol_version);
+    const high = @min(hello.max_version, protocol_version);
+    return .{
+        .version = if (low <= high and low != 0) high else 0,
+        .capabilities = hello.capabilities & 0,
+    };
+}
+
 pub const Info = extern struct {
     clients_len: u64,
     pid: i32,
@@ -207,23 +301,6 @@ pub fn appendMessage(
     if (data.len > 0) {
         list.appendSliceAssumeCapacity(data);
     }
-}
-
-/// Pre-0.7.0 daemons expect a 4-byte Init/Resize payload (rows+cols, no
-/// pixel size) and silently drop the 8-byte form, hanging `zmx attach`
-/// against a running old daemon (#211). Append both encodings: every daemon
-/// drops the length it doesn't expect and processes the other exactly once.
-pub const LEGACY_RESIZE_LEN = 4;
-
-pub fn appendSizeMessage(
-    alloc: std.mem.Allocator,
-    list: *std.ArrayList(u8),
-    tag: Tag,
-    size: Resize,
-) !void {
-    const bytes = encodeResize(size);
-    try appendMessage(alloc, list, tag, &bytes);
-    try appendMessage(alloc, list, tag, bytes[0..LEGACY_RESIZE_LEN]);
 }
 
 fn writeAll(fd: i32, data: []const u8) !void {
@@ -519,9 +596,60 @@ test "Tag wire values are frozen" {
         .{ Tag.Run, 9 },       .{ Tag.Ack, 10 },          .{ Tag.Switch, 11 },
         .{ Tag.Write, 12 },    .{ Tag.TaskComplete, 13 }, .{ Tag.LabelGet, 14 },
         .{ Tag.LabelSet, 15 }, .{ Tag.LabelClear, 16 },   .{ Tag.LabelData, 17 },
-        .{ Tag.Send, 18 },     .{ Tag.EnvGet, 19 },       .{ Tag.EnvSet, 20 },
-        .{ Tag.EnvData, 21 },  .{ Tag.Capture, 22 },
+        .{ Tag.Send, 18 },     .{ Tag.Hello, 19 },        .{ Tag.Welcome, 20 },
+        .{ Tag.EnvGet, 26 },   .{ Tag.EnvSet, 27 },       .{ Tag.EnvData, 28 },
+        .{ Tag.Capture, 29 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
+}
+
+test "Hello wire bytes are frozen" {
+    var buf: [max_hello_len]u8 = undefined;
+    const bytes = try encodeHello(&buf, .{ .min_version = 1, .max_version = 0x0102, .capabilities = 0x04030201, .client = "fmx" });
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 0x01, 0x00, 0x02, 0x01, 0x01, 0x02, 0x03, 0x04, 'f', 'm', 'x' },
+        bytes,
+    );
+    const decoded = try decodeHello(bytes);
+    try std.testing.expectEqual(@as(u16, 1), decoded.min_version);
+    try std.testing.expectEqual(@as(u16, 0x0102), decoded.max_version);
+    try std.testing.expectEqual(@as(u32, 0x04030201), decoded.capabilities);
+    try std.testing.expectEqualStrings("fmx", decoded.client);
+    // A nameless client is legal.
+    const bare = try decodeHello(&.{ 1, 0, 1, 0, 0, 0, 0, 0 });
+    try std.testing.expectEqual(@as(usize, 0), bare.client.len);
+    try std.testing.expectError(error.BadLength, decodeHello(&.{ 1, 0, 1, 0 }));
+    try std.testing.expectError(error.NameTooLong, decodeHello(&([_]u8{0} ** (max_hello_len + 1))));
+    try std.testing.expectError(error.NameTooLong, encodeHello(&buf, .{ .min_version = 1, .max_version = 1, .client = "x" ** (max_client_name_len + 1) }));
+}
+
+test "Welcome wire bytes are frozen" {
+    const welcome = Welcome{ .version = 1, .min_version = 1, .max_version = 0x0102, .capabilities = 0x04030201 };
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 0x01, 0x00, 0x01, 0x00, 0x02, 0x01, 0x01, 0x02, 0x03, 0x04 },
+        &encodeWelcome(welcome),
+    );
+    try std.testing.expectEqual(welcome, try decodeWelcome(&encodeWelcome(welcome)));
+    try std.testing.expectError(error.BadLength, decodeWelcome(&.{ 1, 0 }));
+    try std.testing.expect(!(Welcome{ .version = 0 }).accepted());
+}
+
+test "negotiate picks the highest shared version or rejects" {
+    const exact = negotiate(.{ .min_version = 1, .max_version = 1, .client = "" });
+    try std.testing.expectEqual(protocol_version, exact.version);
+    try std.testing.expect(exact.accepted());
+    // A client that also speaks newer versions lands on ours.
+    try std.testing.expectEqual(protocol_version, negotiate(.{ .min_version = 1, .max_version = 9, .client = "" }).version);
+    // A client that only speaks newer versions is rejected, and told ours.
+    const newer = negotiate(.{ .min_version = protocol_version + 1, .max_version = protocol_version + 2, .client = "" });
+    try std.testing.expect(!newer.accepted());
+    try std.testing.expectEqual(min_protocol_version, newer.min_version);
+    try std.testing.expectEqual(protocol_version, newer.max_version);
+    // Version 0 is "rejected", never a version a client may claim.
+    try std.testing.expect(!negotiate(.{ .min_version = 0, .max_version = 0, .client = "" }).accepted());
+    // Inverted ranges are rejected.
+    try std.testing.expect(!negotiate(.{ .min_version = 2, .max_version = 1, .client = "" }).accepted());
 }
 
 pub fn roundTripForTag(
@@ -553,30 +681,6 @@ pub fn roundTripForTag(
         }
     }
     return error.Unexpected;
-}
-
-test "appendSizeMessage emits current and legacy encodings" {
-    const alloc = std.testing.allocator;
-    var list = try std.ArrayList(u8).initCapacity(alloc, 64);
-    defer list.deinit(alloc);
-
-    const size = Resize{ .rows = 45, .cols = 170, .xpixel = 900, .ypixel = 1800 };
-    try appendSizeMessage(alloc, &list, .Init, size);
-
-    const h1 = decodeHeader(list.items[0..header_len]);
-    try std.testing.expectEqual(Tag.Init, h1.tag);
-    try std.testing.expectEqual(@as(u32, resize_len), h1.len);
-    const p1 = list.items[header_len..][0..resize_len];
-    try std.testing.expectEqual(size, try decodeResize(p1));
-
-    const off2 = header_len + resize_len;
-    const h2 = decodeHeader(list.items[off2..][0..header_len]);
-    try std.testing.expectEqual(Tag.Init, h2.tag);
-    try std.testing.expectEqual(@as(u32, LEGACY_RESIZE_LEN), h2.len);
-    // Legacy payload is the rows+cols prefix of the current encoding.
-    const p2 = list.items[off2 + header_len ..][0..LEGACY_RESIZE_LEN];
-    try std.testing.expectEqualSlices(u8, p1[0..LEGACY_RESIZE_LEN], p2);
-    try std.testing.expectEqual(off2 + header_len + LEGACY_RESIZE_LEN, list.items.len);
 }
 
 test "zeroed Info has no stack garbage in wire bytes" {
