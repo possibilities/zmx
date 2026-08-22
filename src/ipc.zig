@@ -621,6 +621,15 @@ test "Tag wire values are frozen" {
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
 }
 
+test "Capture wire bytes are explicit little endian" {
+    const bytes = [_]u8{ 2, 0x78, 0x56, 0x34, 0x12, 0, 0, 0 };
+    try std.testing.expectEqualSlices(u8, &bytes, &encodeCapture(.{ .format = 2, .rows = 0x12345678 }));
+    const decoded = try decodeCapture(&bytes);
+    try std.testing.expectEqual(@as(u8, 2), decoded.format);
+    try std.testing.expectEqual(@as(u32, 0x12345678), decoded.rows);
+    try std.testing.expectError(error.BadLength, decodeCapture(bytes[0..7]));
+}
+
 test "Hello wire bytes are frozen" {
     var buf: [max_hello_len]u8 = undefined;
     const bytes = try encodeHello(&buf, .{ .min_version = 1, .max_version = 0x0102, .capabilities = 0x04030201, .client = "fmx" });
@@ -652,6 +661,17 @@ test "Welcome wire bytes are frozen" {
     try std.testing.expectEqual(welcome, try decodeWelcome(&encodeWelcome(welcome)));
     try std.testing.expectError(error.BadLength, decodeWelcome(&.{ 1, 0 }));
     try std.testing.expect(!(Welcome{ .version = 0 }).accepted());
+    // The refusal a client must be able to recognize, byte for byte.
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00 },
+        &encodeWelcome(.{ .version = 0 }),
+    );
+    // Constants fmx pins on its side of the wire.
+    try std.testing.expectEqual(@as(u16, 1), protocol_version);
+    try std.testing.expectEqual(@as(u16, 1), min_protocol_version);
+    try std.testing.expectEqual(@as(usize, 64), max_client_name_len);
+    try std.testing.expectEqual(@as(u32, 16 * 1024 * 1024), max_payload_len);
 }
 
 test "negotiate picks the highest shared version or rejects" {
