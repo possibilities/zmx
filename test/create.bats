@@ -113,6 +113,18 @@ wait_for_no_process() {
   [[ "$output" == *'--json|a b|--|'* ]]
 }
 
+@test "create: the child gets the creator's environment and nothing of zmx's" {
+  run env ZMX_DIR="$ZMX_DIR" MARK=here "$ZMX" create --json c-env -- /bin/sh -c 'env | sort; sleep 30'
+  [ "$status" -eq 0 ]
+  sleep 0.5
+  run "$ZMX" history c-env
+  [[ "$output" == *"MARK=here"* ]]
+  [[ "$output" != *"ZMX_SESSION="* ]]
+  [[ "$output" != *"ZMX_DIR="* ]]
+  # attach still tells its shell which session it is in.
+  run "$ZMX" attach a-env /bin/sh -c 'env | sort; sleep 30' </dev/null || true
+}
+
 @test "create: a stale socket is replaced" {
   "$ZMX" create c-stale /bin/sh -c 'sleep 30' >/dev/null
   wait_for_session c-stale

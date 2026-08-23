@@ -129,6 +129,22 @@ make_refused() {
   [[ "$output" == *"state=exited"*"exit_code=7"*"reason=natural"*"label.owner=t" ]]
 }
 
+@test "exit record: a session whose socket was swept still leaves its record" {
+  run "$ZMX" create --json d-swept /bin/sh -c 'sleep 30'
+  local pid
+  pid=$(printf '%s' "$output" | sed -E 's/.*"pid":([0-9]+).*/\1/')
+  wait_for_session d-swept
+  # Something cleared the socket file from under the live daemon; the
+  # child then ends on its own.
+  rm "$ZMX_DIR/d-swept"
+  kill -TERM "$pid"
+  local i=0
+  while [[ ! -e "$ZMX_DIR/exited/d-swept.json" && $i -lt 50 ]]; do sleep 0.1; (( i++ )) || true; done
+  [ -e "$ZMX_DIR/exited/d-swept.json" ]
+  run "$ZMX" inspect --json d-swept
+  [[ "$output" == *'"state":"exited"'* ]]
+}
+
 @test "exit record: a kill is recorded as requested, with the signal" {
   "$ZMX" create d-killed /bin/sh -c 'sleep 30' >/dev/null
   "$ZMX" kill d-killed >/dev/null

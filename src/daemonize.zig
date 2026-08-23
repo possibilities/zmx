@@ -10,6 +10,11 @@ const cross = @import("cross.zig");
 const Cmd = struct {
     file: [*:0]const u8,
     argv_ptr: [*:null]const ?[*:0]const u8,
+    /// The child gets the environment it was given and nothing of zmx's:
+    /// no `ZMX_SESSION`, and `ZMX_DIR` removed. For `create`, whose caller
+    /// owns the session and builds the child's environment deliberately --
+    /// a `zmx` the child runs must not find its supervisor's sessions.
+    plain_env: bool = false,
 };
 
 pub fn createCmdZ(def_shell: []const u8, is_task_mode: bool, command: ?[]const []const u8) !Cmd {
@@ -87,13 +92,17 @@ fn exec(sesh_name: []const u8, cmd: Cmd) !noreturn {
     };
     lib_posix.sigaction(lib_posix.SIG.PIPE, &dfl, null);
 
-    const session_env = try std.fmt.allocPrintSentinel(
-        gpa,
-        "ZMX_SESSION={s}",
-        .{sesh_name},
-        0,
-    );
-    _ = cross.c.putenv(session_env.ptr);
+    if (cmd.plain_env) {
+        _ = cross.c.unsetenv("ZMX_DIR");
+    } else {
+        const session_env = try std.fmt.allocPrintSentinel(
+            gpa,
+            "ZMX_SESSION={s}",
+            .{sesh_name},
+            0,
+        );
+        _ = cross.c.putenv(session_env.ptr);
+    }
 
     if (cross.c.getenv("TERM")) |term_env| {
         if (std.mem.eql(u8, std.mem.span(term_env), "dumb")) {

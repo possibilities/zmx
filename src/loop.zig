@@ -1086,7 +1086,9 @@ pub const Daemon = struct {
         const log_fd = log.log_system.file.?.handle;
 
         var keep_fds_open = [_]i32{ server_sock_fd, dir.handle, log_fd };
-        const cmd = try daemonize.createCmdZ(self.shell, self.is_task_mode, self.command);
+        var cmd = try daemonize.createCmdZ(self.shell, self.is_task_mode, self.command);
+        // A created session's child is the creator's to configure.
+        cmd.plain_env = self.record_exit;
 
         // `cwd_path` is the decoded path, and is empty when the cwd is on
         // another host: OSC 7 crosses SSH boundaries, so a session that ssh'd
@@ -1195,18 +1197,23 @@ pub const Daemon = struct {
             }
             // A caller that swept our refused socket and recreated the name
             // owns it now. Its record would be ours to overwrite and its
-            // socket ours to delete: neither happens.
-            const still_ours = blk: {
-                const st = dir.statFile(new_io, sesh_name, .{}) catch break :blk false;
-                break :blk socket_inode != null and st.inode == socket_inode.?;
+            // socket ours to delete: neither happens. A socket merely swept
+            // -- nothing at the name -- takes nothing from the exit: the
+            // record is what a sweeper comes back for.
+            const name_state: enum { ours, swept, taken } = blk: {
+                const st = dir.statFile(new_io, sesh_name, .{}) catch |err| switch (err) {
+                    error.FileNotFound => break :blk .swept,
+                    else => break :blk .taken,
+                };
+                break :blk if (socket_inode != null and st.inode == socket_inode.?) .ours else .taken;
             };
-            if (still_ours) {
-                if (self.record_exit) self.writeExitRecord(gpa, new_io, dir);
+            if (name_state != .taken and self.record_exit) self.writeExitRecord(gpa, new_io, dir);
+            if (name_state == .ours) {
                 std.log.info("deleting socket file session={s}", .{sesh_name});
                 dir.deleteFile(new_io, sesh_name) catch |err| {
                     std.log.warn("failed to delete socket file err={s}", .{@errorName(err)});
                 };
-            } else {
+            } else if (name_state == .taken) {
                 std.log.info("session name taken over during teardown; leaving it session={s}", .{sesh_name});
             }
             self.deinit(gpa);
