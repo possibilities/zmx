@@ -68,3 +68,24 @@ wait_for_cwd() {
   echo "Timed out waiting for cwd '$pattern' in session '$name'" >&2
   return 1
 }
+
+# Helper: run a command under a real pty, appending what it writes to the
+# terminal to $1, and return its exit status. `attach` refuses to run
+# without a tty. util-linux script (Linux) takes the command as one -c
+# string and returns its status with -e; BSD script (macOS) takes it as
+# arguments and returns its status by default. Both flush as they go
+# (-f/-F) so a watcher sees output before the command ends, and both read
+# their own stdin from /dev/null: bats gives a test no terminal, and script
+# wants one or nothing.
+pty_run() {
+  local log="$1"
+  shift
+  if script --version >/dev/null 2>&1; then
+    local quoted
+    quoted=$(printf '%q ' "$@")
+    script -qefc "$quoted" "$log" </dev/null
+  else
+    script -qF "$log" "$@" </dev/null
+  fi
+}
+

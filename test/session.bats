@@ -241,6 +241,35 @@ load test_helper
   [[ "$output" == *"bats-marker-xyzzy"* ]]
 }
 
+@test "attach: exits with the command's status once the session ends" {
+  # `attach <name> <cmd>` is a way to run cmd; when cmd ends, attach ends
+  # the way it did, and what cmd printed is on the screen even when it
+  # ended before attach had connected.
+  run pty_run "$BATS_TEST_TMPDIR/seven.log" "$ZMX" attach exit-seven sh -c 'echo printed-by-seven; exit 7'
+  [ "$status" -eq 7 ]
+  grep -qF printed-by-seven "$BATS_TEST_TMPDIR/seven.log"
+
+  run pty_run "$BATS_TEST_TMPDIR/term.log" "$ZMX" attach exit-term sh -c 'kill -TERM $$'
+  [ "$status" -eq 143 ]
+
+  run pty_run "$BATS_TEST_TMPDIR/zero.log" "$ZMX" attach exit-zero sh -c 'exit 0'
+  [ "$status" -eq 0 ]
+}
+
+@test "attach: a detach after a task ended still exits 0" {
+  # A task's completion is not the command's end: the shell that ran it is
+  # still there, and a client that detaches from it says so with 0, not
+  # with the task's status.
+  "$ZMX" run task-done -d sh -c 'exit 3'
+  wait_for_session task-done
+  run timeout 10 "$ZMX" wait task-done
+  [ "$status" -eq 3 ]
+  ( sleep 0.5; ZMX_SESSION=task-done "$ZMX" detach ) &
+  run pty_run "$BATS_TEST_TMPDIR/detach.log" "$ZMX" attach task-done
+  wait
+  [ "$status" -eq 0 ]
+}
+
 # ============================================================================
 # Wait
 # ============================================================================

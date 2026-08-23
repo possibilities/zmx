@@ -65,6 +65,8 @@ pub fn clientLoop(client_sock_fd: i32) !ClientResult {
 
     const detach_key_disabled = util.isDetachKeyDisabled();
 
+    // Set by an Exit from the daemon: the session is over, not detached from.
+    var exit_code: ?u8 = null;
     while (true) {
         poll_fds.clearRetainingCapacity();
 
@@ -124,7 +126,7 @@ pub fn clientLoop(client_sock_fd: i32) !ClientResult {
                 } else {
                     std.log.info("eof stdin", .{});
                     // EOF on stdin
-                    return ClientResult{ .kind = .detach, .session_name = null };
+                    return ClientResult{ .kind = .detach, .session_name = null, .exit_code = exit_code };
                 }
             }
         }
@@ -134,7 +136,7 @@ pub fn clientLoop(client_sock_fd: i32) !ClientResult {
             const n = read_buf.read(client_sock_fd) catch |err| {
                 if (err == error.WouldBlock) continue;
                 if (err == error.ConnectionResetByPeer or err == error.BrokenPipe) {
-                    return ClientResult{ .kind = .detach, .session_name = null };
+                    return ClientResult{ .kind = .detach, .session_name = null, .exit_code = exit_code };
                 }
                 std.log.err("daemon read err={s}", .{@errorName(err)});
                 return err;
@@ -142,7 +144,7 @@ pub fn clientLoop(client_sock_fd: i32) !ClientResult {
             if (n == 0) {
                 std.log.info("server closed connection", .{});
                 // Server closed connection
-                return ClientResult{ .kind = .detach, .session_name = null };
+                return ClientResult{ .kind = .detach, .session_name = null, .exit_code = exit_code };
             }
 
             while (read_buf.next()) |msg| {
@@ -151,6 +153,11 @@ pub fn clientLoop(client_sock_fd: i32) !ClientResult {
                         if (msg.payload.len > 0) {
                             try stdout_buf.appendSlice(gpa, msg.payload);
                         }
+                    },
+                    .Exit => {
+                        // The command is gone and the daemon closes after
+                        // this; keep draining output until it does.
+                        exit_code = if (msg.payload.len > 0) msg.payload[0] else 0;
                     },
                     .Resize => {
                         // daemon is asking for the client's window size usually in response
@@ -188,7 +195,7 @@ pub fn clientLoop(client_sock_fd: i32) !ClientResult {
                     if (err == error.WouldBlock) break :blk 0;
                     if (err == error.ConnectionResetByPeer or err == error.BrokenPipe) {
                         std.log.info("connection reset or broken pipe", .{});
-                        return ClientResult{ .kind = .detach, .session_name = null };
+                        return ClientResult{ .kind = .detach, .session_name = null, .exit_code = exit_code };
                     }
                     return err;
                 };
@@ -210,7 +217,7 @@ pub fn clientLoop(client_sock_fd: i32) !ClientResult {
 
         if (poll_fds.items[1].revents & (lib_posix.POLL.HUP | lib_posix.POLL.ERR | lib_posix.POLL.NVAL) != 0) {
             std.log.info("poll hup|err|nval", .{});
-            return ClientResult{ .kind = .detach, .session_name = null };
+            return ClientResult{ .kind = .detach, .session_name = null, .exit_code = exit_code };
         }
     }
 }
@@ -241,6 +248,13 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
     var marker_carry: [32]u8 = undefined;
     var marker_carry_len: usize = 0;
 
+    // Once the pty has closed the loop ends as soon as a client has been
+    // told how the command ended, or after this many polls of this length
+    // when nobody is there to tell.
+    const ending_poll_ms: i32 = 50;
+    const ending_rounds_max: u32 = 40;
+    var ending_rounds: u32 = 0;
+
     daemon_loop: while (daemon.running) {
         poll_fds.clearRetainingCapacity();
 
@@ -254,8 +268,11 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
         if (daemon.pty_write_buf.items.len > 0) {
             pty_events |= lib_posix.POLL.OUT;
         }
+        // A closed pty is left in place, so the indices below hold, but with
+        // fd -1: poll ignores such an entry, where a real fd with no events
+        // would still report POLLHUP on every call.
         try poll_fds.append(gpa, .{
-            .fd = pty_fd,
+            .fd = if (daemon.pty_closed) -1 else pty_fd,
             .events = pty_events,
             .revents = 0,
         });
@@ -274,7 +291,8 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
             });
         }
 
-        _ = try lib_posix.poll(poll_fds.items, -1);
+        const poll_timeout: i32 = if (daemon.pty_closed) ending_poll_ms else -1;
+        _ = try lib_posix.poll(poll_fds.items, poll_timeout);
 
         if (poll_fds.items[2].revents & lib_posix.POLL.IN != 0) {
             signal.drainSignalPipe();
@@ -328,12 +346,10 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
 
             if (n_opt) |n| {
                 if (n == 0) {
-                    // EOF: Shell exited
+                    // EOF: Shell exited. The loop ends below, once a client
+                    // has been told how.
                     std.log.info("shell exited pty_fd={d}", .{pty_fd});
-                    // Let the rest of this poll iteration complete so client
-                    // write buffers are flushed via the normal POLLOUT path.
-                    // On the next iteration, daemon.running will be false.
-                    daemon.running = false;
+                    daemon.pty_closed = true;
                 } else {
                     // Feed PTY output to terminal emulator for state tracking
                     vt_stream.nextSlice(buf[0..n]);
@@ -475,7 +491,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         .LabelClear => try daemon.handleLabelClear(gpa, client),
                         .History => try daemon.handleHistory(gpa, client, &term, msg.payload),
                         .Run => try daemon.handleRun(gpa, io, client, msg.payload),
-                        .Ack, .TaskComplete, .LabelData => {},
+                        .Ack, .TaskComplete, .LabelData, .Exit => {},
                         .Write => try daemon.handleWrite(gpa, client, msg.payload),
                         _ => std.log.warn(
                             "ignoring unknown IPC tag={d}",
@@ -509,6 +525,36 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                 if (last) break :daemon_loop;
             }
         }
+
+        // The command has ended. Read its status without reaping -- the
+        // teardown's waitpid reaps, and an unreaped child keeps its pid and
+        // process group from being reused under handleKill -- and tell the
+        // clients, then stop. A client must have been served first: one
+        // accepted this iteration has not had its Init read, and its
+        // Init is what replays the terminal, which for a command that ended
+        // before anyone attached is all there is to see. A command can end
+        // that early: the creator connects some 10 ms after forking, and a
+        // release build reaches the child well inside that, so with nobody
+        // served the loop holds on, bounded, with the connection queued on
+        // the listening socket meanwhile. What this iteration's POLLOUT path
+        // does not write, flushClients does before the sockets close.
+        if (daemon.pty_closed) {
+            ending_rounds += 1;
+            if (daemon.child_exit_code == null) daemon.child_exit_code = daemon.peekChildStatus();
+            var served = false;
+            for (daemon.clients.items) |c| {
+                if (c.init_seen) served = true;
+            }
+            if ((served and daemon.child_exit_code != null) or ending_rounds >= ending_rounds_max) {
+                if (daemon.child_exit_code) |exit_code| {
+                    for (daemon.clients.items) |c| {
+                        ipc.appendMessage(gpa, &c.write_buf, .Exit, &[_]u8{exit_code}) catch {};
+                        c.has_pending_output = true;
+                    }
+                }
+                daemon.running = false;
+            }
+        }
     }
 }
 
@@ -519,6 +565,9 @@ const ClientResult = struct {
     },
     session_name: ?[]const u8,
     cwd: ?[]const u8 = null,
+    /// The command's exit status, when the daemon sent an Exit before the
+    /// connection ended: the session is over, not merely detached from.
+    exit_code: ?u8 = null,
 };
 
 /// Client represents each terminal that has connected to a session.
@@ -528,6 +577,9 @@ pub const Client = struct {
     alloc: std.mem.Allocator,
     socket_fd: i32,
     has_pending_output: bool = false,
+    /// Its Init has been handled: it has a terminal, and the restore if there
+    /// was one to send.
+    init_seen: bool = false,
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
 
@@ -579,6 +631,8 @@ pub const Daemon = struct {
     is_task_mode: bool = false, // flag for when session is run as a task
     task_id: [4]u8 = undefined,
     task_exit_code: ?u8 = null, // null = running or n/a, set when task completes
+    pty_closed: bool = false, // the pty reached EOF: the command has ended
+    child_exit_code: ?u8 = null, // how it ended, as a shell reports it: code, or 128+signal
     task_ended_at: ?u64 = null, // timestamp when task exited
     pty_fd: i32 = -1, // set by daemonLoop so handleRun can probe the foreground process
     shell: []const u8 = "/bin/sh",
@@ -798,9 +852,52 @@ pub const Daemon = struct {
             _ = lib_posix.waitpid(self.pid, 0);
         }
 
-        try daemonLoop(self, gpa, new_io, server_sock_fd, pty_info.master_fd);
+        daemonLoop(self, gpa, new_io, server_sock_fd, pty_info.master_fd) catch |err| {
+            self.flushClients(gpa);
+            return err;
+        };
+        self.flushClients(gpa);
         std.log.info("daemon loop shutdown", .{});
         return true;
+    }
+
+    /// How the pty child ended, if it has: its status as a shell reports it,
+    /// read with waitid(WNOWAIT) so the child is not reaped -- the teardown's
+    /// waitpid does that, and until then the zombie keeps its pid and process
+    /// group from being reused under handleKill's signals.
+    fn peekChildStatus(self: *Daemon) ?u8 {
+        return child_status.peek(self.pid);
+    }
+
+    /// Write what is still buffered for each client, for at most about a
+    /// second in all. The loop writes only on a POLLOUT it had already polled
+    /// for, so a message appended in its last iteration -- the Exit -- would
+    /// otherwise be lost to the close that follows.
+    fn flushClients(self: *Daemon, gpa: std.mem.Allocator) void {
+        var rounds: usize = 0;
+        while (rounds < 100) : (rounds += 1) {
+            var pending = false;
+            for (self.clients.items) |client| {
+                if (client.write_buf.items.len == 0) continue;
+                var fds = [_]lib_posix.pollfd{.{ .fd = client.socket_fd, .events = lib_posix.POLL.OUT, .revents = 0 }};
+                const ready = lib_posix.poll(&fds, 10) catch return;
+                if (ready == 0 or fds[0].revents & lib_posix.POLL.OUT == 0) {
+                    pending = true;
+                    continue;
+                }
+                const n = lib_posix.write(client.socket_fd, client.write_buf.items) catch |err| {
+                    if (err == error.WouldBlock) {
+                        pending = true;
+                        continue;
+                    }
+                    client.write_buf.clearRetainingCapacity();
+                    continue;
+                };
+                client.write_buf.replaceRange(gpa, 0, n, &[_]u8{}) catch unreachable;
+                if (client.write_buf.items.len > 0) pending = true;
+            }
+            if (!pending) return;
+        }
     }
 
     fn setLeader(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
@@ -905,13 +1002,16 @@ pub const Daemon = struct {
         payload: []const u8,
     ) !void {
         if (payload.len != @sizeOf(ipc.Resize)) return;
+        client.init_seen = true;
 
         // Serialize terminal state BEFORE resize to capture correct cursor position.
         // Resizing triggers reflow which can move the cursor, and the shell's
         // SIGWINCH-triggered redraw will run after our snapshot is sent.
         // Only serialize on re-attach (has_had_client), not first attach, to avoid
-        // interfering with shell initialization (DA1 queries, etc.)
-        if (self.has_pty_output and self.has_had_client) {
+        // interfering with shell initialization (DA1 queries, etc.) -- unless
+        // the command has already ended, when there is no initialization left
+        // to interfere with and the replay is all a first attach can be shown.
+        if (self.has_pty_output and (self.has_had_client or self.pty_closed)) {
             const cursor = &term.screens.active.cursor;
             std.log.debug(
                 "cursor before serialize: x={d} y={d} pending_wrap={}",
@@ -1323,3 +1423,42 @@ test "send queues PTY input without changing leader" {
     try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
     try std.testing.expectEqualStrings("hello", daemon.pty_write_buf.items);
 }
+
+/// A child's exit status read without reaping it. Linux has the waitid
+/// syscall; everything else has libc's, which std does not declare.
+const child_status = struct {
+    const W_EXITED_NOHANG_NOWAIT: u32 = switch (builtin.os.tag) {
+        .linux => std.os.linux.W.EXITED | std.os.linux.W.NOHANG | std.os.linux.W.NOWAIT,
+        else => 0x4 | 0x1 | 0x20, // WEXITED | WNOHANG | WNOWAIT, the BSD values
+    };
+    const CLD_EXITED: c_int = 1;
+
+    extern "c" fn waitid(idtype: c_uint, id: std.c.pid_t, infop: *std.c.siginfo_t, options: c_int) c_int;
+
+    /// The status as a shell reports it -- the exit code, or 128 plus the
+    /// signal -- or null while the child runs.
+    fn peek(pid: std.c.pid_t) ?u8 {
+        switch (builtin.os.tag) {
+            .linux => {
+                const linux = std.os.linux;
+                var info = std.mem.zeroes(linux.siginfo_t);
+                const rc = linux.waitid(.PID, pid, &info, W_EXITED_NOHANG_NOWAIT, null);
+                if (linux.errno(rc) != .SUCCESS) return null;
+                if (info.fields.common.first.piduid.pid == 0) return null;
+                const status = info.fields.common.second.sigchld.status;
+                return shellStatus(info.code, status);
+            },
+            else => {
+                var info = std.mem.zeroes(std.c.siginfo_t);
+                if (waitid(1, pid, &info, @intCast(W_EXITED_NOHANG_NOWAIT)) != 0) return null; // P_PID
+                if (info.pid == 0) return null;
+                return shellStatus(info.code, info.status);
+            },
+        }
+    }
+
+    fn shellStatus(code: c_int, status: i32) u8 {
+        if (code == CLD_EXITED) return @truncate(@as(u32, @bitCast(status)));
+        return 128 +| @as(u8, @truncate(@as(u32, @bitCast(status)) & 0x7f));
+    }
+};

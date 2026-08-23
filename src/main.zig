@@ -1427,7 +1427,17 @@ fn attach(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, labels: ?[]const 
 
     const looper = try loop.clientLoop(client_sock);
     switch (looper.kind) {
-        .detach => return,
+        .detach => {
+            // A session that ended under us said how: exit the way the
+            // command did, so `zmx attach name cmd` can stand in for cmd.
+            // What the deferred restore would do, done here: exit() skips it.
+            if (looper.exit_code) |code| {
+                if (stdin_is_tty) _ = cross.c.tcsetattr(lib_posix.STDIN_FILENO, cross.c.TCSAFLUSH, &orig_termios);
+                _ = lib_posix.write(lib_posix.STDOUT_FILENO, restore_seq) catch {};
+                lib_posix.exit(code);
+            }
+            return;
+        },
         .switch_session => {
             if (looper.session_name) |session_name| {
                 // Reset terminal modes when switching sessions
