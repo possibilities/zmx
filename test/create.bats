@@ -218,14 +218,19 @@ wait_for_no_process() {
   done
 
   # Kill the daemon while it is answering: whatever reached stdout is a
-  # fragment, and the exit status has to say so.
+  # fragment, and the exit status has to say so. The daemon is stopped
+  # before the client asks, so the transfer cannot finish however fast the
+  # build is -- a kill racing a live transfer lost that race on a release
+  # build -- and killed once the client is surely connected and waiting.
   local child daemon
   child=$("$ZMX" inspect --json c-cut | sed -E 's/.*"pid":([0-9]+).*/\1/')
   daemon=$(ps -o ppid= -p "$child" | tr -d ' ')
+  kill -STOP "$daemon"
   # The killer runs in the background so the client stays in the foreground
   # and `run` can see its status.
-  ( sleep 0.02; kill -9 "$daemon" ) &
+  ( sleep 0.5; kill -9 "$daemon" ) &
   run --separate-stderr "$ZMX" history c-cut
+  wait
   [ "$status" -ne 0 ]
   [[ "$stderr" == *"is incomplete"* ]]
 }
