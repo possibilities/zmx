@@ -4,6 +4,7 @@
 pub const Cfg = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const lib_posix = @import("posix.zig");
 const cross = @import("cross.zig");
@@ -130,20 +131,42 @@ fn ensurePrivateDefault(self: *const Cfg) !void {
 fn ensurePrivate(path: []const u8) !void {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path_z = try std.fmt.bufPrintZ(&path_buf, "{s}", .{path});
-    var st: cross.c.struct_stat = undefined;
-    if (cross.c.stat(path_z, &st) != 0) {
+    const owner = statOwner(path_z) orelse {
         std.debug.print("zmx: cannot stat {s}\n", .{path});
         return error.CompanionDirectoryUnreadable;
-    }
+    };
     const uid = lib_posix.getuid();
-    if (st.st_uid != uid) {
-        std.debug.print("zmx: {s} is owned by uid {d}, not {d}; refusing to use it\n", .{ path, st.st_uid, uid });
+    if (owner.uid != uid) {
+        std.debug.print("zmx: {s} is owned by uid {d}, not {d}; refusing to use it\n", .{ path, owner.uid, uid });
         return error.CompanionDirectoryNotOurs;
     }
-    const mode: u32 = @intCast(st.st_mode & 0o777);
+    const mode = owner.mode & 0o777;
     if ((mode & 0o077) != 0) {
         std.debug.print("zmx: {s} is readable or writable by others (mode {o}); refusing to use it (chmod 700 {s})\n", .{ path, mode, path });
         return error.CompanionDirectoryShared;
+    }
+}
+
+const Owner = struct { uid: u32, mode: u32 };
+
+/// Who owns a path and how it is protected. libc's `struct stat` cannot be
+/// imported through @cImport on every target (musl's is opaque to
+/// translate-c), so Linux asks the kernel with statx and everything else
+/// uses libc's fstatat with std's own layout of the result.
+fn statOwner(path_z: [*:0]const u8) ?Owner {
+    switch (builtin.os.tag) {
+        .linux => {
+            const linux = std.os.linux;
+            var st: linux.Statx = undefined;
+            const rc = linux.statx(linux.AT.FDCWD, path_z, 0, .{ .UID = true, .MODE = true }, &st);
+            if (linux.errno(rc) != .SUCCESS) return null;
+            return .{ .uid = st.uid, .mode = st.mode };
+        },
+        else => {
+            var st: std.c.Stat = undefined;
+            if (std.c.fstatat(std.c.AT.FDCWD, path_z, &st, 0) != 0) return null;
+            return .{ .uid = st.uid, .mode = @intCast(st.mode) };
+        },
     }
 }
 
