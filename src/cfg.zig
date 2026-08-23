@@ -4,14 +4,28 @@
 pub const Cfg = @This();
 
 const std = @import("std");
+const build_options = @import("build_options");
 const lib_posix = @import("posix.zig");
 const cross = @import("cross.zig");
+
+/// Built as fmx's Companion (`-Dcompanion`), the default directory is the one
+/// fmx keeps its sessions in — under `/tmp` itself, not `TMPDIR` or
+/// `XDG_RUNTIME_DIR`, because macOS caps a socket path near 104 bytes and
+/// fmx's session names carry a 32-character id — with the logs under it.
+/// `ZMX_DIR` still overrides, which is how fmx's tests keep a private one.
+pub const companion: bool = build_options.companion;
+
+/// A Companion's directory is private: fmx creates it 0700 and refuses one
+/// that others can read, so a `fmx-zmx` run by hand before fmx ever started
+/// must not leave a directory fmx will then reject.
+pub const default_dir_mode: u32 = if (companion) 0o700 else 0o750;
+pub const default_log_mode: u32 = if (companion) 0o600 else 0o640;
 
 socket_dir: []const u8,
 log_dir: []const u8,
 max_scrollback_lines: usize = default_scrollback_lines,
-dir_mode: u32 = 0o750,
-log_mode: u32 = 0o640,
+dir_mode: u32 = default_dir_mode,
+log_mode: u32 = default_log_mode,
 tracked_envs: []const u8 = "DISPLAY,SSH_AUTH_SOCK,SSH_AGENT_PID,SSH_CONNECTION,WINDOWID,XAUTHORITY,KITTY_LISTEN_ON,KITTY_PID,KITTY_WINDOW_ID",
 
 pub const default_scrollback_lines: usize = 10_000;
@@ -23,14 +37,14 @@ pub fn init(alloc: std.mem.Allocator, io: std.Io) !Cfg {
     errdefer alloc.free(log_dir);
 
     const dir_mode = if (lib_posix.getenv("ZMX_DIR_MODE")) |m|
-        std.fmt.parseInt(u32, m, 8) catch 0o750
+        std.fmt.parseInt(u32, m, 8) catch default_dir_mode
     else
-        0o750;
+        default_dir_mode;
 
     const log_mode = if (lib_posix.getenv("ZMX_LOG_MODE")) |m|
-        std.fmt.parseInt(u32, m, 8) catch 0o640
+        std.fmt.parseInt(u32, m, 8) catch default_log_mode
     else
-        0o640;
+        default_log_mode;
 
     // Lines of scrollback the shadow terminal keeps, which is what a restore
     // can replay. Unset or unparsable keeps the default.
@@ -58,6 +72,8 @@ fn socketDir(alloc: std.mem.Allocator) ![]const u8 {
 
     const socket_dir: []const u8 = if (lib_posix.getenv("ZMX_DIR")) |zmxdir|
         try alloc.dupe(u8, zmxdir)
+    else if (companion)
+        try std.fmt.allocPrint(alloc, "/tmp/fmx-{d}/zmx", .{uid})
     else if (lib_posix.getenv("XDG_RUNTIME_DIR")) |xdg_runtime|
         try std.fmt.allocPrint(alloc, "{s}/zmx", .{xdg_runtime})
     else
@@ -69,6 +85,8 @@ fn socketDir(alloc: std.mem.Allocator) ![]const u8 {
 fn logDir(alloc: std.mem.Allocator) ![]const u8 {
     const log_dir = if (lib_posix.getenv("ZMX_DIR")) |zmxdir|
         try std.fmt.allocPrint(alloc, "{s}/logs", .{zmxdir})
+    else if (companion)
+        try std.fmt.allocPrint(alloc, "/tmp/fmx-{d}/zmx/logs", .{lib_posix.getuid()})
     else if (lib_posix.getenv("XDG_STATE_HOME")) |xdg_state_home|
         try std.fmt.allocPrint(alloc, "{s}/zmx/logs", .{xdg_state_home})
     else if (lib_posix.getenv("HOME")) |home_dir|
@@ -129,8 +147,8 @@ test "Cfg.init uses default modes when env vars are not set" {
     var cfg = try Cfg.init(alloc, std.testing.io);
     defer cfg.deinit(alloc);
 
-    try std.testing.expectEqual(@as(u32, 0o750), cfg.dir_mode);
-    try std.testing.expectEqual(@as(u32, 0o640), cfg.log_mode);
+    try std.testing.expectEqual(default_dir_mode, cfg.dir_mode);
+    try std.testing.expectEqual(default_log_mode, cfg.log_mode);
 }
 
 test "Cfg.init uses custom modes from env vars" {

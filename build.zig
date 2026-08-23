@@ -18,8 +18,19 @@ pub fn build(b: *std.Build) void {
     const version = b.option([]const u8, "version", "Version string for release") orelse
         @as([]const u8, build_zig_zon.version);
 
+    // Built as fmx's Companion, zmx keeps its sessions in fmx's directory by
+    // default (/tmp/fmx-<uid>/zmx, logs under it) rather than in the one a
+    // stock zmx on the same machine uses, so a bare `fmx-zmx list` by hand
+    // finds fmx's sessions and never lists or sweeps a human's own.
+    const companion = b.option(
+        bool,
+        "companion",
+        "Build as fmx's Companion: the default directory is /tmp/fmx-<uid>/zmx",
+    ) orelse false;
+
     const options = b.addOptions();
     options.addOption([]const u8, "version", version);
+    options.addOption(bool, "companion", companion);
     const ghostty_ver = build_zig_zon.dependencies.ghostty.hash;
     options.addOption([]const u8, "ghostty_version", ghostty_ver);
 
@@ -83,6 +94,7 @@ pub fn build(b: *std.Build) void {
             "ghostty-vt",
             test_dep.module("ghostty-vt"),
         );
+        test_module.addOptions("build_options", options);
         const exe_unit_tests = b.addTest(.{
             .root_module = test_module,
             // .use_llvm = true,
