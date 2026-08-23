@@ -780,15 +780,24 @@ fn help(io: std.Io) !void {
         \\Environment variables:
         \\  SHELL                Default shell for new sessions
         \\  ZMX_DIR              Socket directory (priority 1)
+    ++ "\n" ++ (if (Cfg.companion)
+        \\  (unset)              /tmp/fmx-<uid>/zmx, fmx's own, created private
+        \\
+    else
         \\  XDG_RUNTIME_DIR      Socket directory (priority 2)
         \\  TMPDIR               Socket directory (priority 3)
+        \\
+    ) ++
         \\  ZMX_SESSION          Session name (injected automatically; makes attach
         \\                       switch this session)
         \\  ZMX_SESSION_PREFIX   Prefix added to all session names
         \\  ZMX_TRACK_ENV        Comma-separated list of environment variables to track
         \\                       from attaching clients
-        \\  ZMX_DIR_MODE         Sets mode for socket and log directories (octal, defaults to 0750)
-        \\  ZMX_LOG_MODE         Sets mode for log files (octal, defaults to 0640)
+    ++ "\n" ++ std.fmt.comptimePrint(
+        \\  ZMX_DIR_MODE         Sets mode for socket and log directories (octal, defaults to {o:0>4})
+        \\  ZMX_LOG_MODE         Sets mode for log files (octal, defaults to {o:0>4})
+        \\
+    , .{ Cfg.default_dir_mode, Cfg.default_log_mode }) ++
         \\  ZMX_NO_DETACH_KEY    Disables the ctrl+\ detach shortcut (set to any value)
         \\
     ;

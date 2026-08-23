@@ -111,6 +111,40 @@ pub fn mkdir(self: *Cfg, io: std.Io) !void {
     try mkdirAll(io, self.socket_dir, sock_perms);
     const log_perms = std.Io.Dir.Permissions.fromMode(@intCast(self.dir_mode));
     try mkdirAll(io, self.log_dir, log_perms);
+    if (companion and lib_posix.getenv("ZMX_DIR") == null) try self.ensurePrivateDefault();
+}
+
+/// The Companion's default directory sits under `/tmp`, which is shared
+/// and sticky, at a predictable name: anyone could have made it first, and a
+/// directory another user owns or others can traverse would let them reach
+/// the sockets in it. fmx checks the same thing before every start; a
+/// Companion run by hand checks it here, so the by-hand path is no weaker.
+/// Both levels must be ours and closed to others, or nothing proceeds.
+fn ensurePrivateDefault(self: *const Cfg) !void {
+    var parent_buf: [64]u8 = undefined;
+    const parent = try std.fmt.bufPrint(&parent_buf, "/tmp/fmx-{d}", .{lib_posix.getuid()});
+    try ensurePrivate(parent);
+    try ensurePrivate(self.socket_dir);
+}
+
+fn ensurePrivate(path: []const u8) !void {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_z = try std.fmt.bufPrintZ(&path_buf, "{s}", .{path});
+    var st: cross.c.struct_stat = undefined;
+    if (cross.c.stat(path_z, &st) != 0) {
+        std.debug.print("zmx: cannot stat {s}\n", .{path});
+        return error.CompanionDirectoryUnreadable;
+    }
+    const uid = lib_posix.getuid();
+    if (st.st_uid != uid) {
+        std.debug.print("zmx: {s} is owned by uid {d}, not {d}; refusing to use it\n", .{ path, st.st_uid, uid });
+        return error.CompanionDirectoryNotOurs;
+    }
+    const mode: u32 = @intCast(st.st_mode & 0o777);
+    if ((mode & 0o077) != 0) {
+        std.debug.print("zmx: {s} is readable or writable by others (mode {o}); refusing to use it (chmod 700 {s})\n", .{ path, mode, path });
+        return error.CompanionDirectoryShared;
+    }
 }
 
 fn mkdirAll(io: std.Io, sub_dir_path: []const u8, permissions: std.Io.Dir.Permissions) !void {

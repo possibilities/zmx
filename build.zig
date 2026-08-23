@@ -28,6 +28,15 @@ pub fn build(b: *std.Build) void {
         "Build as fmx's Companion: the default directory is /tmp/fmx-<uid>/zmx",
     ) orelse false;
 
+    // A build string naming fmx (`<version>+fmx.<commit>`) is what fmx
+    // pins, and fmx trusts it to mean a Companion build; one without
+    // -Dcompanion would pass the pin and then keep a human's by-hand
+    // sessions in the stock directory. Refuse to build it.
+    const refused: ?*std.Build.Step.Fail = if (!companion and std.mem.indexOf(u8, version, "+fmx.") != null)
+        b.addFail("a version naming fmx (+fmx.) needs -Dcompanion")
+    else
+        null;
+
     const options = b.addOptions();
     options.addOption([]const u8, "version", version);
     options.addOption(bool, "companion", companion);
@@ -66,6 +75,7 @@ pub fn build(b: *std.Build) void {
             // .use_lld = !is_macos,
             .root_module = exe_mod,
         });
+        if (refused) |fail| exe.step.dependOn(&fail.step);
 
         b.installArtifact(exe);
         const run_cmd = b.addRunArtifact(exe);
