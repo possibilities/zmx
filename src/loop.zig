@@ -909,9 +909,18 @@ pub const Daemon = struct {
         // Serialize terminal state BEFORE resize to capture correct cursor position.
         // Resizing triggers reflow which can move the cursor, and the shell's
         // SIGWINCH-triggered redraw will run after our snapshot is sent.
-        // Only serialize on re-attach (has_had_client), not first attach, to avoid
-        // interfering with shell initialization (DA1 queries, etc.)
-        if (self.has_pty_output and self.has_had_client) {
+        //
+        // Whenever the terminal already holds output, the client gets it: on
+        // a re-attach, and on a first attach too. The daemon reaches the child
+        // before the first client connects (a release build is fast enough
+        // that `zmx attach s sh -c 'echo hi; ...'` loses the `hi` every time,
+        // and a `run -d` session attached later has only ever been seen by the
+        // shadow terminal), so what the child printed before the first Init
+        // exists nowhere else. Shell initialization is not disturbed by the
+        // replay: until a client has sent Init, the daemon answers the shell's
+        // terminal queries itself (see respondToDeviceAttributes), and the
+        // serialized state is what the shell has already drawn, not a query.
+        if (self.has_pty_output) {
             const cursor = &term.screens.active.cursor;
             std.log.debug(
                 "cursor before serialize: x={d} y={d} pending_wrap={}",

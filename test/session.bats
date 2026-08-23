@@ -241,6 +241,24 @@ load test_helper
   [[ "$output" == *"bats-marker-xyzzy"* ]]
 }
 
+@test "attach: a first attach shows what the command printed before it" {
+  # `attach <name> <cmd>` starts the daemon and then connects to it, and the
+  # daemon starts the command in between. Whatever the command prints before
+  # that first connection lands only in the daemon's shadow terminal; the
+  # first Init must replay it, or it is gone. The window is real: a release
+  # build (zig build -Doptimize=ReleaseFast) lost the line below every time
+  # before the daemon replayed on a first attach.
+  local log="$BATS_TEST_TMPDIR/attach.log"
+  pty_run "$log" "$ZMX" attach first-attach sh -c 'echo printed-at-start; sleep 30' &
+  local attach_pid=$!
+  wait_for_session first-attach
+  local seen=0
+  if wait_for_file_text "$log" printed-at-start; then seen=1; fi
+  ZMX_SESSION=first-attach "$ZMX" detach
+  wait "$attach_pid" || true
+  [ "$seen" -eq 1 ]
+}
+
 # ============================================================================
 # Wait
 # ============================================================================
