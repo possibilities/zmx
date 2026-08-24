@@ -144,6 +144,7 @@ wait_for_no_process() {
   run "$ZMX" create --help
   [ "$status" -eq 0 ]
   [[ "$output" == *"Usage:"* ]]
+  [[ "$output" == *"--exit-on-last-client"* ]]
   run "$ZMX" list --short
   [[ "$output" == "" ]]
 }

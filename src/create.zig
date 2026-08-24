@@ -31,6 +31,10 @@ pub const Options = struct {
     /// Lines of scrollback the session keeps; null keeps the configured
     /// default (`ZMX_SCROLLBACK_LINES`, else 2000).
     scrollback_lines: ?usize = null,
+    /// End the child after the final attached terminal Client disconnects.
+    /// The policy is armed only after the first Init, so creation and probes
+    /// cannot tear the session down before a terminal reaches it.
+    exit_on_last_client: bool = false,
 };
 
 /// Machine-readable failure names. Stable: fmx matches on them.
@@ -116,6 +120,7 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, opts: Options) !u8 
     daemon.initial_labels = opts.labels;
     daemon.startup_timeout_ms = opts.timeout_ms;
     daemon.record_exit = true;
+    daemon.exit_on_last_client = opts.exit_on_last_client;
     std.log.info("socket path={s}", .{daemon.socket_path});
 
     const is_daemon = daemon.createSession(io) catch |err| switch (err) {
@@ -248,6 +253,7 @@ pub const Args = struct {
     json: bool = false,
     timeout_ms: u32 = Daemon.default_startup_timeout_ms,
     scrollback_lines: ?usize = null,
+    exit_on_last_client: bool = false,
     want_help: bool = false,
     usage_error: ?[]const u8 = null,
 };
@@ -277,6 +283,10 @@ pub fn parseArgs(argv: []const []const u8) Args {
         }
         if (std.mem.eql(u8, arg, "--json")) {
             parsed.json = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--exit-on-last-client")) {
+            parsed.exit_on_last_client = true;
             continue;
         }
         if (flagValue(argv, &i, "--labels")) |v| {
@@ -334,14 +344,15 @@ fn flagValue(argv: []const []const u8, i: *usize, comptime flag: []const u8) ??[
 }
 
 test "parseArgs: flags before the name, command after it" {
-    const argv: []const []const u8 = &.{ "--json", "--labels", "a=1 b=2", "--timeout-ms=250", "--scrollback-lines", "9000", "work", "--", "/bin/sh", "-c", "echo --json" };
+    const argv: []const []const u8 = &.{ "--json", "--exit-on-last-client", "--labels", "a=1 b=2", "--timeout-ms=250", "--scrollback-lines", "9000", "work", "--", "/bin/sh", "-c", "echo --json" };
     const p = parseArgs(argv);
     try std.testing.expect(p.json);
     try std.testing.expectEqualStrings("a=1 b=2", p.labels.?);
     try std.testing.expectEqual(@as(u32, 250), p.timeout_ms);
     try std.testing.expectEqual(@as(?usize, 9000), p.scrollback_lines);
+    try std.testing.expect(p.exit_on_last_client);
     try std.testing.expectEqualStrings("work", p.name);
-    try std.testing.expectEqual(@as(usize, 8), p.command_start);
+    try std.testing.expectEqual(@as(usize, 9), p.command_start);
     try std.testing.expect(p.usage_error == null);
 }
 

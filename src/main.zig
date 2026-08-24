@@ -274,6 +274,7 @@ pub fn main(init: std.process.Init) !void {
             .json = parsed.json,
             .timeout_ms = parsed.timeout_ms,
             .scrollback_lines = parsed.scrollback_lines,
+            .exit_on_last_client = parsed.exit_on_last_client,
             .cwd = cwd,
             .shell = shell_env,
         });
@@ -602,7 +603,7 @@ fn help(io: std.Io) !void {
         \\
         \\Commands:
         \\  [a]ttach [--labels kv] <name> [command...]                 Attach to session, creating if needed
-        \\  create [--labels kv] [--json] <name> [--] <command...>
+        \\  create [--labels kv] [--json] [--exit-on-last-client] <name> [--] <command...>
         \\                                           Create a session without attaching
         \\  [r]un <name> [-d] [command...]                             Send command without attaching
         \\  [s]end <name> <text...>                                    Send raw input to session PTY
@@ -638,6 +639,8 @@ fn help(io: std.Io) !void {
         \\  error and message; a Timeout says only that no report arrived, so
         \\  inspect the name before assuming nothing started.
         \\  --timeout-ms bounds the wait (default 5000);
+        \\  --exit-on-last-client ends the child after the last attached
+        \\  terminal disconnects (it has no effect before the first attach);
         \\  --scrollback-lines sets how much a restore can replay (default
         \\  10000, or ZMX_SCROLLBACK_LINES). It counts screen rows, so a line
         \\  that wraps costs more than one, and pruning frees whole pages, so
