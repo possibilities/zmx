@@ -757,17 +757,24 @@ fn hasPrivateMarker(csi: ghostty_vt.Parser.Action.CSI) bool {
     return false;
 }
 
-/// Detect if the payload contains user input that should be printed to the screen or
-/// is a key combination like up-arrow, backspace, enter, ctrl+f, etc.
-///
-/// Terminal-generated replies must not count: every attached client's terminal
-/// answers the queries the app broadcasts, so a reply from a passive viewer
-/// would otherwise make it leader and resize the session to its window.
+/// Detect if the payload contains an interactive terminal event. Keyboard,
+/// paste, mouse, and focus-gained input all mean the client is active; terminal
+/// replies and focus loss do not.
 pub fn isUserInput(payload: []const u8) bool {
     var parser = ghostty_vt.Parser.init();
     var i: usize = 0;
     while (i < payload.len) {
         if (payload[i] == 0x1b and i + 2 < payload.len and payload[i + 1] == '[') {
+            // SGR mouse starts with the private '<' parameter and ends in M
+            // (press/move/wheel) or m (release). Check the raw introducer so a
+            // plain SGR attributes sequence ending in lowercase m is not mouse.
+            if (payload[i + 2] == '<') {
+                var end = i + 3;
+                while (end < payload.len and
+                    (std.ascii.isDigit(payload[end]) or payload[end] == ';')) : (end += 1)
+                {}
+                if (end < payload.len and (payload[end] == 'M' or payload[end] == 'm')) return true;
+            }
             if (parseKittyCsiU(payload[i + 2 ..])) |kitty| {
                 if (kitty.event_type != 3) return true;
                 i += 2 + kitty.consumed;
@@ -793,12 +800,13 @@ pub fn isUserInput(payload: []const u8) bool {
                     if (!status_reply and (csi.final == 'u' or csi.final == '~')) return true;
                     // modified arrow keys (e.g., Ctrl+F sends CSI 1;5C in legacy mode)
                     if (csi.final >= 'A' and csi.final <= 'D' and csi.params.len > 1) return true;
-                    // mouse events: CSI M (basic) or CSI < (SGR extended) - EXCLUDE these
-                    // only intentional keyboard input should trigger leader switch
-                    if (csi.final == 'M' or csi.final == '<') return false;
-                    // focus events: CSI I (focus in) or CSI O (focus out) - EXCLUDE these
-                    // these are automatic terminal events, not user typing
-                    if (csi.final == 'I' or csi.final == 'O') return false;
+                    // Basic mouse input dispatches as uppercase M. SGR mouse was
+                    // recognized from its raw private parameter above.
+                    if (csi.final == 'M') return true;
+                    // Entering a terminal is interaction; leaving one is not.
+                    if (csi.final == 'I') return true;
+                    // Do not return for focus loss: later bytes in the same
+                    // payload may still contain real interaction.
                 },
                 .execute => |code| {
                     // looking for CR, LF, tab, and backspace
@@ -2239,24 +2247,24 @@ test "isUserInput: kitty keyboard sequences" {
     try testing.expect(isUserInput("\x1b[102;1:1u\x1b[67;65;31M")); // key press with mouse noise
 }
 
-test "isUserInput: mouse events (CSI M) excluded" {
+test "isUserInput: basic mouse events are interaction" {
     // Basic mouse tracking (SGR disabled): CSI M Cb Cx Cy
-    // Mouse events should NOT trigger leader switch
-    try testing.expect(!isUserInput("\x1b[M@ 0 0")); // button 0, pos 0,0
-    try testing.expect(!isUserInput("\x1b[M@ 1 1")); // button 1, pos 1,1
+    try testing.expect(isUserInput("\x1b[M@ 0 0")); // button 0, pos 0,0
+    try testing.expect(isUserInput("\x1b[M@ 1 1")); // button 1, pos 1,1
 }
 
-test "isUserInput: mouse events SGR mode CSI < excluded" {
+test "isUserInput: SGR mouse press release and motion are interaction" {
     // SGR extended mouse tracking: CSI < Cb;Cx;Y M
-    // Mouse events should NOT trigger leader switch
-    try testing.expect(!isUserInput("\x1b[<0;1;1M")); // button release
-    try testing.expect(!isUserInput("\x1b[<64;1;1M")); // button press
+    try testing.expect(isUserInput("\x1b[<0;1;1M")); // button press
+    try testing.expect(isUserInput("\x1b[<0;1;1m")); // button release
+    try testing.expect(isUserInput("\x1b[<35;10;5M")); // passive motion
+    try testing.expect(isUserInput("\x1b[<64;1;1M")); // wheel
 }
 
-test "isUserInput: focus events excluded" {
-    // Focus in/out are automatic terminal events, not user typing
-    try testing.expect(!isUserInput("\x1b[I")); // focus in
+test "isUserInput: focus gain is interaction and focus loss is not" {
+    try testing.expect(isUserInput("\x1b[I")); // focus in
     try testing.expect(!isUserInput("\x1b[O")); // focus out
+    try testing.expect(isUserInput("\x1b[Ox")); // focus out followed by a key
 }
 
 test "isUserInput: terminal query replies excluded" {

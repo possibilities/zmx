@@ -1390,7 +1390,7 @@ pub const Daemon = struct {
                 self.noteTerminalActivity(client);
             } else {
                 // Apply this terminal's remembered dimensions before its first
-                // keyboard, mouse, or paste bytes reach the Runtime.
+                // keyboard, mouse, paste, or focus-gained bytes reach the Runtime.
                 try self.setLeader(gpa, client, pty_fd, term);
             }
             self.queuePtyInput(gpa, payload);
