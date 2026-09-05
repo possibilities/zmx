@@ -299,6 +299,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
     defer poll_fds.deinit(gpa);
 
     const init_size = ipc.getTerminalSize(pty_fd);
+    try validateTerminalSize(init_size);
     var term = try initTerminal(gpa, io, init_size, daemon.cfg);
     defer term.deinit(gpa);
     var vt_stream = term.vtStream();
@@ -319,12 +320,21 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
     const drain_grace_ms = 2000;
 
     daemon_loop: while (daemon.running) {
+        // Do this before poll: a peer that never drains may never be writable.
+        var closing = daemon.clients.items.len;
+        while (closing > 0) {
+            closing -= 1;
+            const client = daemon.clients.items[closing];
+            if (client.disconnect and daemon.closeClient(gpa, client, closing, pty_fd, &term)) break :daemon_loop;
+        }
         // If the program asked for focus reports (DECSET 1004), send focus-out
         // when the last attached client leaves and focus-in when one returns,
         // as a terminal would when its window loses/gains focus.
         const has_terminal_client = daemon.hasAttachedTerminalClient();
         if (has_terminal_client != had_terminal_client and term.modes.get(.focus_event)) {
-            daemon.queuePtyInput(gpa, if (has_terminal_client) "\x1b[I" else "\x1b[O");
+            daemon.queuePtyInput(gpa, if (has_terminal_client) "\x1b[I" else "\x1b[O") catch |err| {
+                std.log.warn("focus report refused: {s}", .{@errorName(err)});
+            };
         }
         had_terminal_client = has_terminal_client;
 
@@ -447,7 +457,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     if (!daemon.hasAttachedTerminalClient() and
                         daemon.pty_write_buf.items.len < Daemon.PTY_WRITE_BUF_MAX)
                     {
-                        util.respondToDeviceAttributes(gpa, &daemon.pty_write_buf, buf[0..n]);
+                        util.respondToDeviceAttributes(gpa, &daemon.pty_write_buf, buf[0..n], Daemon.PTY_WRITE_BUF_MAX);
                     }
 
                     // In run mode, scan output for exit code marker. The marker
@@ -468,7 +478,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
 
                             // Notify connected clients
                             for (daemon.clients.items) |c| {
-                                ipc.appendMessage(gpa, &c.write_buf, .TaskComplete, &[_]u8{exit_code}) catch {};
+                                c.queueMessage(gpa, .TaskComplete, &[_]u8{exit_code}) catch {};
                                 c.has_pending_output = true;
                             }
                         }
@@ -491,7 +501,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                             continue;
                         }
                         if (!client.receivesLiveOutput()) continue;
-                        ipc.appendMessage(gpa, &client.write_buf, .Output, broadcast_data) catch |err| {
+                        client.queueMessage(gpa, .Output, broadcast_data) catch |err| {
                             std.log.warn(
                                 "failed to buffer output for client err={s}",
                                 .{@errorName(err)},
@@ -557,14 +567,14 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     // A client whose Hello was refused is on its way out: its
                     // Welcome(0) still has to flush, but nothing it says is
                     // acted on, least of all Input reaching the PTY.
-                    if (client.phase == .rejected) break;
-                    switch (msg.header.tag) {
-                        .Input => try daemon.handleInput(gpa, client, pty_fd, &term, msg.payload),
+                    if (client.phase == .rejected or client.disconnect) break;
+                    const handled: anyerror!void = switch (msg.header.tag) {
+                        .Input => daemon.handleInput(gpa, client, pty_fd, &term, msg.payload),
                         .Send => daemon.handleSend(gpa, msg.payload),
-                        .Output => try daemon.handleOutput(gpa, msg.payload, &term, &vt_stream),
-                        .Init => try daemon.handleInit(gpa, client, pty_fd, &term, msg.payload),
-                        .Switch => try daemon.handleSwitch(gpa, msg.payload),
-                        .Resize => try daemon.handleResize(gpa, client, pty_fd, &term, msg.payload),
+                        .Output => daemon.handleOutput(gpa, msg.payload, &term, &vt_stream),
+                        .Init => daemon.handleInit(gpa, client, pty_fd, &term, msg.payload),
+                        .Switch => daemon.handleSwitch(gpa, msg.payload),
+                        .Resize => daemon.handleResize(gpa, client, pty_fd, &term, msg.payload),
                         .Detach => {
                             const last = daemon.handleDetach(gpa, client, i, pty_fd, &term);
                             if (last) break :daemon_loop;
@@ -591,25 +601,32 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                                 draining_until = std.Io.Timestamp.now(io, .boot).toMilliseconds() + drain_grace_ms;
                             }
                         },
-                        .Info => try daemon.handleInfo(gpa, client, &term),
-                        .LabelGet => try daemon.handleLabelGet(gpa, client),
-                        .LabelSet => try daemon.handleLabelSet(gpa, client, msg.payload),
-                        .LabelClear => try daemon.handleLabelClear(gpa, client),
-                        .EnvGet => try daemon.handleEnvGet(gpa, client),
-                        .EnvSet => try daemon.handleEnvSet(gpa, client, msg.payload),
-                        .History => try daemon.handleHistory(gpa, client, &term, msg.payload),
-                        .Capture => try daemon.handleCapture(gpa, client, &term, msg.payload),
-                        .Run => try daemon.handleRun(gpa, io, client, msg.payload),
+                        .Info => daemon.handleInfo(gpa, client, &term),
+                        .LabelGet => daemon.handleLabelGet(gpa, client),
+                        .LabelSet => daemon.handleLabelSet(gpa, client, msg.payload),
+                        .LabelClear => daemon.handleLabelClear(gpa, client),
+                        .EnvGet => daemon.handleEnvGet(gpa, client),
+                        .EnvSet => daemon.handleEnvSet(gpa, client, msg.payload),
+                        .History => daemon.handleHistory(gpa, client, &term, msg.payload),
+                        .Capture => daemon.handleCapture(gpa, client, &term, msg.payload),
+                        .Run => daemon.handleRun(gpa, io, client, msg.payload),
                         // Frames a daemon never receives: these travel the
                         // other way, and a client sending one says nothing.
                         .Ack, .TaskComplete, .LabelData, .EnvData, .Welcome, .RestoreBegin, .Ready, .Exit => {},
-                        .Write => try daemon.handleWrite(gpa, client, msg.payload),
-                        .Hello => try daemon.handleHello(gpa, client, msg.payload),
+                        .Write => daemon.handleWrite(gpa, client, msg.payload),
+                        .Hello => daemon.handleHello(gpa, client, msg.payload),
                         _ => std.log.warn(
                             "ignoring unknown IPC tag={d}",
                             .{@intFromEnum(msg.header.tag)},
                         ),
-                    }
+                    };
+                    handled catch |err| {
+                        std.log.warn("refusing client command tag={d} err={s}", .{ @intFromEnum(msg.header.tag), @errorName(err) });
+                        const last = daemon.closeClient(gpa, client, i, pty_fd, &term);
+                        if (last) break :daemon_loop;
+                        continue :clients_loop;
+                    };
+                    if (client.disconnect) break;
                 }
             }
 
@@ -680,9 +697,12 @@ const ClientResult = struct {
     exit: ?ipc.Exit = null,
 };
 
-/// Client represents each terminal that has connected to a session.
-///
-/// Multiple Clients can connect to a single session.
+fn validateTerminalSize(size: ipc.Resize) !void {
+    if (size.cols == 0 or size.rows == 0 or size.cols > 4096 or size.rows > 4096 or
+        @as(u32, size.cols) * @as(u32, size.rows) > 262144) return error.InvalidTerminalSize;
+}
+
+/// One connected terminal or one-shot control peer.
 pub const Client = struct {
     alloc: std.mem.Allocator,
     socket_fd: i32,
@@ -691,6 +711,7 @@ pub const Client = struct {
     write_buf: std.ArrayList(u8),
     env_str: ?[]u8 = null,
     phase: Phase = .connected,
+    disconnect: bool = false,
     /// Live PTY output that arrived while `negotiated`, held back so the
     /// restore sent by Init is the first output the client sees. If Init
     /// sends no restore (a first attach), this is flushed instead, so a
@@ -710,6 +731,23 @@ pub const Client = struct {
     last_activity: u64 = 0,
 
     pub const preready_max = 1024 * 1024;
+    pub const output_max = 64 * 1024 * 1024;
+
+    pub fn queueMessage(self: *Client, gpa: std.mem.Allocator, tag: ipc.Tag, data: []const u8) !void {
+        if (self.disconnect) return error.ClientDisconnected;
+        if (data.len > ipc.max_payload_len) return error.FrameTooLarge;
+        if (data.len > output_max - ipc.header_len or self.write_buf.items.len > output_max - ipc.header_len - data.len) {
+            std.log.warn("disconnecting slow client fd={d}: output queue full", .{self.socket_fd});
+            self.disconnect = true;
+            self.write_buf.clearAndFree(gpa);
+            self.preready_buf.clearAndFree(gpa);
+            return error.ClientOutputQueueFull;
+        }
+        ipc.appendMessage(gpa, &self.write_buf, tag, data) catch |err| {
+            self.disconnect = true;
+            return err;
+        };
+    }
 
     /// Where a client is in the versioned contract. A client that never
     /// sends Hello stays `connected` and gets pre-negotiation behavior,
@@ -1312,7 +1350,7 @@ pub const Daemon = struct {
         } else {
             // Legacy/early input can arrive before Init. Ask for its size and
             // let the Resize response complete ownership.
-            try ipc.appendMessage(gpa, &client.write_buf, .Resize, "");
+            try client.queueMessage(gpa, .Resize, "");
             client.has_pending_output = true;
         }
     }
@@ -1346,32 +1384,13 @@ pub const Daemon = struct {
         return null;
     }
 
-    const PTY_WRITE_BUF_MAX = 256 * 1024;
+    const PTY_WRITE_BUF_MAX = ipc.max_payload_len;
 
-    /// Queue bytes for the PTY's stdin. Flushed by daemonLoop on POLLOUT.
-    /// Drops the payload if the buffer is over cap -- same failure mode as
-    /// the old direct-write ptyWrite (drop on EAGAIN), just at a 64x higher
-    /// threshold. Capping avoids OOM when the shell stops reading; dropping
-    /// new (not old) bytes avoids tearing a partially-accepted sequence.
-    fn queuePtyInput(self: *Daemon, gpa: std.mem.Allocator, data: []const u8) void {
-        if (data.len == 0) return;
-        if (self.pty_write_buf.items.len + data.len > PTY_WRITE_BUF_MAX) {
-            std.log.warn(
-                "pty input dropped {d} bytes (buffer full, shell not reading)",
-                .{data.len},
-            );
-            return;
-        }
-
-        // NOTE: for local dev only
-        // std.log.debug("buffering pty input data={x}", .{data});
-
-        self.pty_write_buf.appendSlice(gpa, data) catch |err| {
-            std.log.warn(
-                "pty input dropped {d} bytes: {s}",
-                .{ data.len, @errorName(err) },
-            );
-        };
+    /// A bounded PTY input queue. Failure closes only the requesting client;
+    /// the caller cannot mistake missing input for a live transport.
+    fn queuePtyInput(self: *Daemon, gpa: std.mem.Allocator, data: []const u8) !void {
+        if (self.pty_write_buf.items.len > PTY_WRITE_BUF_MAX or data.len > PTY_WRITE_BUF_MAX - self.pty_write_buf.items.len) return error.InputQueueFull;
+        try self.pty_write_buf.appendSlice(gpa, data);
     }
 
     pub fn handleInput(
@@ -1393,18 +1412,20 @@ pub const Daemon = struct {
                 // keyboard, mouse, paste, or focus-gained bytes reach the Runtime.
                 try self.setLeader(gpa, client, pty_fd, term);
             }
-            self.queuePtyInput(gpa, payload);
+            try self.queuePtyInput(gpa, payload);
         } else if (self.leader_client_fd == client.socket_fd) {
-            self.queuePtyInput(gpa, payload);
+            try self.queuePtyInput(gpa, payload);
         }
     }
 
     /// Queue input from `zmx send` without changing interactive client leadership.
-    pub fn handleSend(self: *Daemon, gpa: std.mem.Allocator, payload: []const u8) void {
-        self.queuePtyInput(gpa, payload);
+    pub fn handleSend(self: *Daemon, gpa: std.mem.Allocator, payload: []const u8) !void {
+        try self.queuePtyInput(gpa, payload);
     }
 
     pub fn handleSwitch(self: *Daemon, gpa: std.mem.Allocator, session_name: []const u8) !void {
+        const suffix = if (self.cwd.len > 0 and self.cwd_path.len > 0) 1 + self.cwd.len else 0;
+        if (suffix > ipc.max_payload_len or session_name.len > ipc.max_payload_len - suffix) return error.FrameTooLarge;
         for (self.clients.items) |client| {
             if (self.leader_client_fd == client.socket_fd) {
                 // Include the daemon's current cwd so the new session can start
@@ -1417,14 +1438,14 @@ pub const Daemon = struct {
                     @memcpy(payload[0..session_name.len], session_name);
                     payload[session_name.len] = '\n';
                     @memcpy(payload[session_name.len + 1 ..], self.cwd);
-                    ipc.appendMessage(gpa, &client.write_buf, .Switch, payload) catch |err| {
+                    client.queueMessage(gpa, .Switch, payload) catch |err| {
                         std.log.warn(
                             "failed to buffer terminal state for client err={s}",
                             .{@errorName(err)},
                         );
                     };
                 } else {
-                    ipc.appendMessage(gpa, &client.write_buf, .Switch, session_name) catch |err| {
+                    client.queueMessage(gpa, .Switch, session_name) catch |err| {
                         std.log.warn(
                             "failed to buffer terminal state for client err={s}",
                             .{@errorName(err)},
@@ -1467,7 +1488,7 @@ pub const Daemon = struct {
                 .{ self.session_name, client.socket_fd, @errorName(err) },
             );
             client.phase = .rejected;
-            try ipc.appendMessage(gpa, &client.write_buf, .Welcome, &ipc.encodeWelcome(.{ .version = 0 }));
+            try client.queueMessage(gpa, .Welcome, &ipc.encodeWelcome(.{ .version = 0 }));
             client.has_pending_output = true;
             return;
         };
@@ -1490,7 +1511,7 @@ pub const Daemon = struct {
                 .{ self.session_name, client.socket_fd, name, hello.min_version, hello.max_version, ipc.min_protocol_version, ipc.protocol_version },
             );
         }
-        try ipc.appendMessage(gpa, &client.write_buf, .Welcome, &ipc.encodeWelcome(welcome));
+        try client.queueMessage(gpa, .Welcome, &ipc.encodeWelcome(welcome));
         client.has_pending_output = true;
     }
 
@@ -1502,51 +1523,17 @@ pub const Daemon = struct {
         term: *ghostty_vt.Terminal,
         payload: []const u8,
     ) !void {
-        // Registered before anything can return: an Init this daemon cannot
-        // read must still end the handshake, or a negotiated client that sent
-        // a malformed one would never receive output again.
-        //
-        // Whatever restore Init buffers below is the first output a
-        // negotiated client sees; live output resumes after it. With no
-        // restore, the output held since Hello goes out so none is lost.
-        var restore_sent = false;
-        defer if (client.phase == .negotiated) {
-            // Ready closes the boundary RestoreBegin opened: everything
-            // between the two is restored state, everything after is live.
-            ipc.appendMessage(gpa, &client.write_buf, .Ready, "") catch |err| {
-                std.log.warn("failed to buffer ready for client err={s}", .{@errorName(err)});
-            };
-            client.phase = .ready;
-            client.has_pending_output = true;
-            if (!restore_sent and !client.preready_overflow and client.preready_buf.items.len > 0) {
-                ipc.appendMessage(gpa, &client.write_buf, .Output, client.preready_buf.items) catch |err| {
-                    std.log.warn("failed to flush held output for client err={s}", .{@errorName(err)});
-                };
-            }
-            client.preready_buf.clearAndFree(gpa);
-        };
-        // Opened before anything is serialized, so a client resets its screen
-        // before the first restored byte lands on it -- which is what makes
-        // restoring into a screen that already has content safe.
-        if (client.phase == .negotiated) {
-            ipc.appendMessage(gpa, &client.write_buf, .RestoreBegin, "") catch |err| {
-                std.log.warn("failed to buffer restore boundary for client err={s}", .{@errorName(err)});
-            };
-            client.has_pending_output = true;
-        }
-        const size = ipc.decodeResize(payload) catch |err| {
-            std.log.warn(
-                "malformed Init session={s} fd={d} len={d} err={s}",
-                .{ self.session_name, client.socket_fd, payload.len, @errorName(err) },
-            );
-            return;
-        };
-        client.is_terminal_client = true;
-        client.terminal_size = size;
+        const size = try ipc.decodeResize(payload);
+        try validateTerminalSize(size);
+        // A failed Restore closes this peer. Nothing below commits attachment
+        // or arms exit-on-last-client until the whole boundary has been queued.
+        errdefer client.disconnect = true;
+        const negotiated = client.phase == .negotiated;
+        if (negotiated) try client.queueMessage(gpa, .RestoreBegin, "");
 
-        // Lay out Restore at the attaching terminal's size before the PTY
-        // receives that size and triggers its own redraw.
-        try resizeTerm(gpa, term, size.cols, size.rows);
+        // Keep the shadow terminal and PTY unchanged until Restore queues in
+        // full. Upstream resizes before serializing; our fallible attachment
+        // boundary must not let a failed peer alter the running session.
 
         // A client that has not negotiated is restored only on re-attach, as
         // it always was: it has no way to be told a restore is coming, and
@@ -1564,39 +1551,35 @@ pub const Daemon = struct {
                 "cursor before serialize: x={d} y={d} pending_wrap={}",
                 .{ cursor.x, cursor.y, cursor.pending_wrap },
             );
-            if (util.serializeTerminalState(gpa, term)) |term_output| {
-                std.log.debug("serialize terminal state", .{});
-                // Rewrite OSC 133;A to include redraw=0 so the outer terminal
-                // does not clear prompt lines on resize (issue #111).
-                const restore_data = util.rewritePromptRedraw(gpa, term_output) orelse term_output;
-                defer gpa.free(term_output);
-                defer if (restore_data.ptr != term_output.ptr) gpa.free(restore_data);
-                // Sent as however many frames it takes rather than one: a
-                // long scrollback must not be capped by the frame size.
-                var offset: usize = 0;
-                while (offset < restore_data.len) {
-                    const end = @min(offset + RESTORE_CHUNK, restore_data.len);
-                    ipc.appendMessage(gpa, &client.write_buf, .Output, restore_data[offset..end]) catch |err| {
-                        std.log.warn(
-                            "failed to buffer terminal state for client err={s}",
-                            .{@errorName(err)},
-                        );
-                        break;
-                    };
-                    offset = end;
-                    // Set from the first chunk on: even a snapshot cut short
-                    // already contains the held bytes, and replaying them over
-                    // it would duplicate what did get through.
-                    restore_sent = true;
-                }
-                client.has_pending_output = true;
+            const term_output = util.serializeTerminalState(gpa, term) orelse return error.RestoreFailed;
+            defer gpa.free(term_output);
+            // Rewrite OSC 133;A to avoid clearing prompt lines on resize.
+            const restore_data = util.rewritePromptRedraw(gpa, term_output) orelse term_output;
+            defer if (restore_data.ptr != term_output.ptr) gpa.free(restore_data);
+            var offset: usize = 0;
+            while (offset < restore_data.len) {
+                const end = @min(offset + RESTORE_CHUNK, restore_data.len);
+                try client.queueMessage(gpa, .Output, restore_data[offset..end]);
+                offset = end;
+            }
+        }
+        if (negotiated) {
+            try client.queueMessage(gpa, .Ready, "");
+            if (!restore_wanted and !client.preready_overflow and client.preready_buf.items.len > 0) {
+                try client.queueMessage(gpa, .Output, client.preready_buf.items);
             }
         }
 
-        // A completed attach is always the newest connection and therefore
-        // the sizing owner, even while another terminal remains connected.
-        if (self.exit_on_last_client) self.exit_on_last_client_armed = true;
-        try self.setLeader(gpa, client, pty_fd, term);
+        // Apply the size before committing ownership and lifecycle. Failure
+        // must not turn an incomplete first attach into a last-client exit.
+        try self.applyTerminalSize(gpa, pty_fd, term, size);
+        client.terminal_size = size;
+        client.is_terminal_client = true;
+        if (negotiated) client.phase = .ready;
+        client.has_pending_output = true;
+        client.preready_buf.clearAndFree(gpa);
+        self.leader_client_fd = client.socket_fd;
+        self.noteTerminalActivity(client);
         // Same-size reattaches also need a redraw after Restore is queued.
         if (self.has_pty_output and self.has_had_client) {
             var pgrp: lib_posix.pid_t = 0;
@@ -1605,6 +1588,7 @@ pub const Daemon = struct {
             }
         }
         self.has_had_client = true;
+        if (self.exit_on_last_client) self.exit_on_last_client_armed = true;
     }
 
     pub fn handleResize(
@@ -1615,8 +1599,11 @@ pub const Daemon = struct {
         term: *ghostty_vt.Terminal,
         payload: []const u8,
     ) !void {
-        const size = ipc.decodeResize(payload) catch return;
-        client.is_terminal_client = true;
+        const size = try ipc.decodeResize(payload);
+        try validateTerminalSize(size);
+        // Run clients also send Resize, but only Init completes a terminal
+        // attachment. A tail-only client cannot answer terminal queries or
+        // keep an exit-on-last-client Session alive.
         client.terminal_size = size;
         // A host resize is interaction for sizing purposes, whoever owned the
         // Runtime a moment ago.
@@ -1660,7 +1647,7 @@ pub const Daemon = struct {
             // Only a client that negotiated knows this frame; a legacy one
             // learns what it always did, from the socket closing.
             if (client.phase != .ready) continue;
-            ipc.appendMessage(gpa, &client.write_buf, .Exit, &ipc.encodeExit(status)) catch |err| {
+            client.queueMessage(gpa, .Exit, &ipc.encodeExit(status)) catch |err| {
                 std.log.warn("failed to buffer exit for client err={s}", .{@errorName(err)});
                 continue;
             };
@@ -1772,7 +1759,7 @@ pub const Daemon = struct {
         info.cwd_len = @intCast(@min(self.cwd.len, ipc.MAX_CWD_LEN));
         @memcpy(info.cwd[0..info.cwd_len], self.cwd[0..info.cwd_len]);
 
-        try ipc.appendMessage(gpa, &client.write_buf, .Info, std.mem.asBytes(&info));
+        try client.queueMessage(gpa, .Info, std.mem.asBytes(&info));
         client.has_pending_output = true;
     }
 
@@ -1784,10 +1771,13 @@ pub const Daemon = struct {
         payload: []const u8,
     ) !void {
         self.setPwd(term);
-        const format: util.HistoryFormat = if (payload.len > 0)
-            @enumFromInt(payload[0])
-        else
-            .plain;
+        if (payload.len > 1) return error.InvalidPayload;
+        const format: util.HistoryFormat = if (payload.len == 0) .plain else switch (payload[0]) {
+            0 => .plain,
+            1 => .vt,
+            2 => .html,
+            else => return error.InvalidPayload,
+        };
         if (util.serializeTerminal(gpa, term, format)) |output| {
             defer gpa.free(output);
             // As many frames as it takes, so the frame size is not a cap on
@@ -1802,13 +1792,13 @@ pub const Daemon = struct {
                 const end = @min(offset + util.history_chunk, output.len);
                 const chunk = output[offset..end];
                 chunks += 1;
-                ipc.appendMessage(gpa, &client.write_buf, .History, chunk) catch |err| {
+                client.queueMessage(gpa, .History, chunk) catch |err| {
                     std.log.warn(
                         "failed to buffer history session={s} bytes={d} err={s}",
                         .{ self.session_name, output.len, @errorName(err) },
                     );
                     // Close the sequence so the client is not left waiting.
-                    ipc.appendMessage(gpa, &client.write_buf, .History, "") catch {};
+                    client.queueMessage(gpa, .History, "") catch {};
                     break;
                 };
                 offset = end;
@@ -1822,7 +1812,7 @@ pub const Daemon = struct {
             );
             client.has_pending_output = true;
         } else {
-            try ipc.appendMessage(gpa, &client.write_buf, .History, "");
+            try client.queueMessage(gpa, .History, "");
             client.has_pending_output = true;
         }
     }
@@ -1834,17 +1824,17 @@ pub const Daemon = struct {
         term: *ghostty_vt.Terminal,
         payload: []const u8,
     ) !void {
-        const request = ipc.decodeCapture(payload) catch return;
-        const format = std.enums.fromInt(util.HistoryFormat, request.format) orelse return;
+        const request = try ipc.decodeCapture(payload);
+        const format = std.enums.fromInt(util.HistoryFormat, request.format) orelse return error.InvalidPayload;
         self.setPwd(term);
         const output = util.serializeTerminalRange(gpa, term, format, request.rows);
         defer if (output) |text| gpa.free(text);
-        const text = output orelse "";
+        const text = output orelse return error.HistoryFailed;
         var offset: usize = 0;
         while (true) {
             const end = @min(offset + util.history_chunk, text.len);
             const chunk = text[offset..end];
-            try ipc.appendMessage(gpa, &client.write_buf, .Capture, chunk);
+            try client.queueMessage(gpa, .Capture, chunk);
             offset = end;
             if (chunk.len < util.history_chunk) break;
         }
@@ -1852,15 +1842,13 @@ pub const Daemon = struct {
     }
 
     pub fn handleRun(self: *Daemon, gpa: std.mem.Allocator, io: std.Io, client: *Client, payload: []const u8) !void {
+        const queued_before = self.pty_write_buf.items.len;
+        errdefer self.pty_write_buf.shrinkRetainingCapacity(queued_before);
         // Reset task tracking so the new command's exit marker is detected.
         // Without this, a second `zmx run` on the same session is ignored
         // because task_exit_code is still set from the first run.
-        self.task_exit_code = null;
-        self.task_ended_at = null;
-        self.is_task_mode = true;
-        self.task_id = util.generateTaskId(io);
-
-        if (payload.len == 0) return;
+        if (payload.len == 0) return error.InvalidPayload;
+        const task_id = util.generateTaskId(io);
 
         const cmd = payload;
 
@@ -1869,7 +1857,7 @@ pub const Daemon = struct {
         // the command contains a heredoc (`<<`), the delimiter must be alone
         // on its line, so the marker goes on the next line instead.
         var buf: [1024]u8 = undefined;
-        const marker = try util.getTaskExitMarker(&buf, self.task_id);
+        const marker = try util.getTaskExitMarker(&buf, task_id);
         var single_buf: [1024]u8 = undefined;
         const single_line_marker = try std.fmt.bufPrint(&single_buf, "; echo {s}$?\r", .{marker});
         var here_buf: [1024]u8 = undefined;
@@ -1877,13 +1865,17 @@ pub const Daemon = struct {
         const uses_heredoc = std.mem.indexOf(u8, cmd, "<<") != null;
 
         if (cmd.len > 0 and cmd[cmd.len - 1] == '\r') {
-            self.queuePtyInput(gpa, cmd[0 .. cmd.len - 1]);
+            try self.queuePtyInput(gpa, cmd[0 .. cmd.len - 1]);
         } else {
-            self.queuePtyInput(gpa, cmd);
+            try self.queuePtyInput(gpa, cmd);
         }
-        self.queuePtyInput(gpa, if (uses_heredoc) heredoc_marker else single_line_marker);
+        try self.queuePtyInput(gpa, if (uses_heredoc) heredoc_marker else single_line_marker);
 
-        try ipc.appendMessage(gpa, &client.write_buf, .Ack, "");
+        try client.queueMessage(gpa, .Ack, "");
+        self.task_exit_code = null;
+        self.task_ended_at = null;
+        self.is_task_mode = true;
+        self.task_id = task_id;
         client.has_pending_output = true;
         self.has_had_client = true;
         std.log.debug("run command len={d}", .{payload.len});
@@ -1948,7 +1940,7 @@ pub const Daemon = struct {
                 continue;
             }
             if (!client.receivesLiveOutput()) continue;
-            ipc.appendMessage(gpa, &client.write_buf, .Output, payload) catch |err| {
+            client.queueMessage(gpa, .Output, payload) catch |err| {
                 std.log.warn("failed to buffer output for client err={s}", .{@errorName(err)});
                 continue;
             };
@@ -1962,12 +1954,19 @@ pub const Daemon = struct {
     }
 
     pub fn handleWrite(self: *Daemon, gpa: std.mem.Allocator, client: *Client, payload: []const u8) !void {
+        const queued_before = self.pty_write_buf.items.len;
+        errdefer self.pty_write_buf.shrinkRetainingCapacity(queued_before);
         // Wire format: [u32 path len][path bytes][file content]
         if (payload.len < @sizeOf(u32)) return error.InvalidPayload;
-        const path_len = std.mem.bytesToValue(u32, payload[0..@sizeOf(u32)]);
-        if (payload.len < @sizeOf(u32) + path_len) return error.InvalidPayload;
+        const path_len: usize = std.mem.readInt(u32, payload[0..4], .little);
+        if (path_len == 0 or path_len > payload.len - 4) return error.InvalidPayload;
         const file_path = payload[@sizeOf(u32)..][0..path_len];
         const file_content = payload[@sizeOf(u32) + path_len ..];
+        for (file_path) |byte| {
+            if (byte < 0x20 or byte == 0x7f) return error.InvalidPayload;
+        }
+        const quoted_path = try util.shellQuote(gpa, file_path);
+        defer gpa.free(quoted_path);
 
         // Inject file creation through the PTY so it works over SSH.
         // Base64-encode content and pipe through printf | base64 -d > file.
@@ -1987,22 +1986,21 @@ pub const Daemon = struct {
             defer gpa.free(encoded);
             _ = std.base64.standard.Encoder.encode(encoded, chunk);
 
-            self.queuePtyInput(gpa, "printf '%s' '");
-            self.queuePtyInput(gpa, encoded);
+            try self.queuePtyInput(gpa, "printf '%s' '");
+            try self.queuePtyInput(gpa, encoded);
             if (is_first) {
-                self.queuePtyInput(gpa, "' | base64 -d > '");
+                try self.queuePtyInput(gpa, "' | base64 -d > ");
             } else {
-                self.queuePtyInput(gpa, "' | base64 -d >> '");
+                try self.queuePtyInput(gpa, "' | base64 -d >> ");
             }
-            self.queuePtyInput(gpa, file_path);
-            self.queuePtyInput(gpa, "'");
-            self.queuePtyInput(gpa, "\r");
+            try self.queuePtyInput(gpa, quoted_path);
+            try self.queuePtyInput(gpa, "\r");
 
             offset = end;
             is_first = false;
         }
 
-        try ipc.appendMessage(gpa, &client.write_buf, .Ack, "");
+        try client.queueMessage(gpa, .Ack, "");
         client.has_pending_output = true;
         self.has_had_client = true;
         std.log.debug(
@@ -2014,24 +2012,23 @@ pub const Daemon = struct {
     fn handleEnvGet(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
         const leader_opt = self.getLeaderClient();
         const payload = if (leader_opt) |leader| leader.env_str orelse "" else "";
-        try ipc.appendMessage(gpa, &client.write_buf, .EnvData, payload);
+        try client.queueMessage(gpa, .EnvData, payload);
         client.has_pending_output = true;
     }
 
     fn handleEnvSet(_: *Daemon, gpa: std.mem.Allocator, client: *Client, env_str: []const u8) !void {
-        std.log.info("handle env set payload={s}", .{env_str});
         try client.setEnv(gpa, env_str);
 
-        try ipc.appendMessage(gpa, &client.write_buf, .Ack, "");
+        try client.queueMessage(gpa, .Ack, "");
         client.has_pending_output = true;
     }
 
     fn handleLabelGet(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
         const out = try label.labelsToU8(gpa, self.labels);
         defer gpa.free(out);
-        ipc.appendMessage(gpa, &client.write_buf, .LabelData, out) catch |err| {
+        client.queueMessage(gpa, .LabelData, out) catch |err| {
             std.log.warn("labels too large to send err={s}", .{@errorName(err)});
-            ipc.appendMessage(gpa, &client.write_buf, .LabelData, "") catch {};
+            client.queueMessage(gpa, .LabelData, "") catch {};
         };
         client.has_pending_output = true;
     }
@@ -2039,7 +2036,7 @@ pub const Daemon = struct {
     fn handleLabelSet(self: *Daemon, gpa: std.mem.Allocator, client: *Client, labels: []const u8) !void {
         std.log.info("handle label set payload={s}", .{labels});
         try self.applyLabels(gpa, labels);
-        try ipc.appendMessage(gpa, &client.write_buf, .Ack, "");
+        try client.queueMessage(gpa, .Ack, "");
         client.has_pending_output = true;
     }
 
@@ -2078,7 +2075,7 @@ pub const Daemon = struct {
             gpa.free(entry.value_ptr.*);
         }
         self.labels.clearRetainingCapacity();
-        try ipc.appendMessage(gpa, &client.write_buf, .Ack, "");
+        try client.queueMessage(gpa, .Ack, "");
         client.has_pending_output = true;
     }
 };
@@ -2160,7 +2157,7 @@ fn testDaemon() Daemon {
     };
 }
 
-fn testClient(alloc: std.mem.Allocator, fd: i32, is_terminal: bool) !*Client {
+fn testSocketClient(alloc: std.mem.Allocator, fd: i32, is_terminal: bool) !*Client {
     const c = try alloc.create(Client);
     c.* = .{ .alloc = alloc, .socket_fd = fd, .read_buf = try ipc.SocketBuffer.init(alloc), .write_buf = .empty };
     c.is_terminal_client = is_terminal;
@@ -2180,22 +2177,22 @@ test "hasTerminalClient follows attach, detach and detach-all" {
     try std.testing.expect(!daemon.hasAttachedTerminalClient());
 
     // A run/send/tail client doesn't count.
-    const tail_client = try testClient(alloc, a[0], false);
+    const tail_client = try testSocketClient(alloc, a[0], false);
     try daemon.clients.append(alloc, tail_client);
     try std.testing.expect(!daemon.hasAttachedTerminalClient());
 
     // An attach client does, until it disconnects.
-    const term_client = try testClient(alloc, a[1], true);
+    const term_client = try testSocketClient(alloc, a[1], true);
     try daemon.clients.append(alloc, term_client);
     try std.testing.expect(daemon.hasAttachedTerminalClient());
-    _ = daemon.closeClient(alloc, tail_client, 0, false);
+    _ = daemon.closeClient(alloc, tail_client, 0, -1, undefined);
     try std.testing.expect(daemon.hasAttachedTerminalClient());
-    _ = daemon.closeClient(alloc, term_client, 0, false);
+    _ = daemon.closeClient(alloc, term_client, 0, -1, undefined);
     try std.testing.expect(!daemon.hasAttachedTerminalClient());
 
-    try daemon.clients.append(alloc, try testClient(alloc, b[0], true));
-    try daemon.clients.append(alloc, try testClient(alloc, b[1], true));
-    daemon.handleDetachAll(alloc);
+    try daemon.clients.append(alloc, try testSocketClient(alloc, b[0], true));
+    try daemon.clients.append(alloc, try testSocketClient(alloc, b[1], true));
+    _ = daemon.handleDetachAll(alloc);
     try std.testing.expect(!daemon.hasAttachedTerminalClient());
     try std.testing.expectEqual(@as(?i32, null), daemon.leader_client_fd);
 }
@@ -2206,7 +2203,7 @@ test "send queues PTY input without changing leader" {
     daemon.leader_client_fd = 42;
     defer daemon.pty_write_buf.deinit(alloc);
 
-    daemon.handleSend(alloc, "hello");
+    try daemon.handleSend(alloc, "hello");
 
     try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
     try std.testing.expectEqualStrings("hello", daemon.pty_write_buf.items);
@@ -2271,7 +2268,7 @@ test "handleEnvGet returns leader client's environment variables including unset
     client_req.write_buf.clearRetainingCapacity();
 
     // Set client1 as leader
-    try daemon.setLeader(alloc, &client1);
+    try daemon.setLeader(alloc, &client1, -1, undefined);
     try std.testing.expectEqual(@as(?i32, fds1[0]), daemon.leader_client_fd);
     try daemon.handleEnvGet(alloc, &client_req);
     // Wire message: [Header][Payload]
@@ -2280,7 +2277,7 @@ test "handleEnvGet returns leader client's environment variables including unset
     client_req.write_buf.clearRetainingCapacity();
 
     // Switch leader to client2
-    try daemon.setLeader(alloc, &client2);
+    try daemon.setLeader(alloc, &client2, -1, undefined);
     try std.testing.expectEqual(@as(?i32, fds2[0]), daemon.leader_client_fd);
     try daemon.handleEnvGet(alloc, &client_req);
     const pay2 = client_req.write_buf.items[ipc.header_len..];
@@ -2331,4 +2328,142 @@ test "waitid observes an exited child without reaping it" {
     reaped = true;
     try std.testing.expectEqual(pid, waited.pid);
     try std.testing.expectEqual(ipc.Exit{ .code = 7 }, ipc.exitFromWaitStatus(waited.status, .natural));
+}
+
+fn testClient(alloc: std.mem.Allocator) !Client {
+    return .{ .alloc = alloc, .socket_fd = -1, .read_buf = try ipc.SocketBuffer.init(alloc), .write_buf = .empty };
+}
+
+fn deinitTestClient(client: *Client) void {
+    client.read_buf.deinit();
+    client.write_buf.deinit(client.alloc);
+    client.preready_buf.deinit(client.alloc);
+}
+
+test "invalid terminal dimensions cannot open a Restore or claim sizing" {
+    const alloc = std.testing.allocator;
+    var daemon = testDaemon();
+    var client = try testClient(alloc);
+    defer deinitTestClient(&client);
+    client.phase = .negotiated;
+    var term: ghostty_vt.Terminal = undefined;
+    for ([_]ipc.Resize{
+        .{ .cols = 0, .rows = 24 },        .{ .cols = 80, .rows = 0 },
+        .{ .cols = 65535, .rows = 65535 }, .{ .cols = 4096, .rows = 65 },
+    }) |size| {
+        try std.testing.expectError(error.InvalidTerminalSize, daemon.handleInit(alloc, &client, -1, &term, &ipc.encodeResize(size)));
+        try std.testing.expectEqual(Client.Phase.negotiated, client.phase);
+        try std.testing.expect(!client.is_terminal_client);
+        try std.testing.expectEqual(@as(usize, 0), client.write_buf.items.len);
+    }
+    try validateTerminalSize(.{ .cols = 4096, .rows = 64 });
+}
+
+test "queued output is capped and released for a stalled client" {
+    const alloc = std.testing.allocator;
+    var client = try testClient(alloc);
+    defer deinitTestClient(&client);
+    const chunk = try alloc.alloc(u8, 1024 * 1024);
+    defer alloc.free(chunk);
+    @memset(chunk, 'x');
+    for (0..63) |_| try client.queueMessage(alloc, .Output, chunk);
+    try std.testing.expectError(error.ClientOutputQueueFull, client.queueMessage(alloc, .Output, chunk));
+    try std.testing.expect(client.disconnect);
+    try std.testing.expectEqual(@as(usize, 0), client.write_buf.items.len);
+    try std.testing.expectError(error.ClientDisconnected, client.queueMessage(alloc, .Ready, ""));
+    try std.testing.expectEqual(@as(usize, 0), client.write_buf.items.len);
+}
+
+test "failed Run keeps prior task tracking and leaves no partial command" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    defer threaded.deinit();
+    var daemon = testDaemon();
+    defer daemon.pty_write_buf.deinit(alloc);
+    var client = try testClient(alloc);
+    defer deinitTestClient(&client);
+    daemon.task_exit_code = 7;
+    daemon.task_ended_at = 123;
+    const task_id = daemon.task_id;
+    try daemon.pty_write_buf.resize(alloc, Daemon.PTY_WRITE_BUF_MAX - 3);
+    const before = daemon.pty_write_buf.items.len;
+    try std.testing.expectError(error.InputQueueFull, daemon.handleRun(alloc, threaded.io(), &client, "abc"));
+    try std.testing.expectEqual(before, daemon.pty_write_buf.items.len);
+    try std.testing.expectEqual(task_id, daemon.task_id);
+    try std.testing.expectEqual(@as(?u8, 7), daemon.task_exit_code);
+    try std.testing.expectEqual(@as(?u64, 123), daemon.task_ended_at);
+    try std.testing.expectEqual(@as(usize, 0), client.write_buf.items.len);
+}
+
+test "Write checks path lengths and terminal controls before queuing bytes" {
+    const alloc = std.testing.allocator;
+    var daemon = testDaemon();
+    defer daemon.pty_write_buf.deinit(alloc);
+    var client = try testClient(alloc);
+    defer deinitTestClient(&client);
+    for ([_][]const u8{ "", &.{ 255, 255, 255, 255 }, &.{ 1, 0, 0, 0, 0x15 } }) |payload| {
+        try std.testing.expectError(error.InvalidPayload, daemon.handleWrite(alloc, &client, payload));
+        try std.testing.expectEqual(@as(usize, 0), daemon.pty_write_buf.items.len);
+    }
+    const path = "agent's notes.txt";
+    var payload: [4 + path.len + 2]u8 = undefined;
+    std.mem.writeInt(u32, payload[0..4], path.len, .little);
+    @memcpy(payload[4..][0..path.len], path);
+    @memcpy(payload[4 + path.len ..], "ok");
+    try daemon.handleWrite(alloc, &client, &payload);
+    const quoted = try util.shellQuote(alloc, path);
+    defer alloc.free(quoted);
+    try std.testing.expect(std.mem.indexOf(u8, daemon.pty_write_buf.items, quoted) != null);
+}
+
+test "an unacknowledged Run or Write queues no command and changes no task" {
+    const alloc = std.testing.allocator;
+    var daemon = testDaemon();
+    defer daemon.pty_write_buf.deinit(alloc);
+    daemon.task_exit_code = 7;
+    daemon.task_ended_at = 123;
+    const task_id = daemon.task_id;
+    for (0..2) |operation| {
+        var client = try testClient(alloc);
+        defer deinitTestClient(&client);
+        try client.write_buf.resize(alloc, Client.output_max);
+        const result = if (operation == 0)
+            daemon.handleRun(alloc, std.testing.io, &client, "echo ok")
+        else
+            daemon.handleWrite(alloc, &client, &.{ 1, 0, 0, 0, 'x', 'a' });
+        try std.testing.expectError(error.ClientOutputQueueFull, result);
+        try std.testing.expectEqual(@as(usize, 0), daemon.pty_write_buf.items.len);
+        try std.testing.expectEqual(task_id, daemon.task_id);
+        try std.testing.expectEqual(@as(?u8, 7), daemon.task_exit_code);
+        try std.testing.expectEqual(@as(?u64, 123), daemon.task_ended_at);
+    }
+}
+
+test "a failed Restore does not complete attach or arm last-client exit" {
+    const alloc = std.testing.allocator;
+    for (0..2) |failure| {
+        var daemon = testDaemon();
+        daemon.exit_on_last_client = true;
+        daemon.has_pty_output = failure == 1;
+        var client = try testClient(alloc);
+        defer deinitTestClient(&client);
+        client.phase = .negotiated;
+        var term = try ghostty_vt.Terminal.init(std.testing.io, alloc, .{ .cols = 80, .rows = 24 });
+        defer term.deinit(alloc);
+        // First fail at Ready after RestoreBegin fits, then at serialization
+        // after the boundary fits without an allocation.
+        try client.write_buf.ensureTotalCapacity(alloc, if (failure == 0) Client.output_max else 64);
+        if (failure == 0) client.write_buf.items.len = Client.output_max - ipc.header_len;
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+        const result = daemon.handleInit(if (failure == 0) alloc else failing.allocator(), &client, -1, &term, &ipc.encodeResize(.{ .cols = 80, .rows = 24 }));
+        try std.testing.expectError(if (failure == 0) error.ClientOutputQueueFull else error.RestoreFailed, result);
+        try std.testing.expect(client.disconnect);
+        try std.testing.expectEqual(Client.Phase.negotiated, client.phase);
+        try std.testing.expect(!client.is_terminal_client);
+        try std.testing.expect(!daemon.has_had_client);
+        try std.testing.expect(!daemon.hasAttachedTerminalClient());
+        try std.testing.expect(!daemon.exit_on_last_client_armed);
+        try std.testing.expectEqual(@as(?i32, null), daemon.leader_client_fd);
+        if (failure == 1) try std.testing.expectEqual(@as(usize, ipc.header_len), client.write_buf.items.len);
+    }
 }

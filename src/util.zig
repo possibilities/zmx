@@ -324,7 +324,7 @@ const DA2_QUERY_EXPLICIT = "\x1b[>0c";
 const DA1_RESPONSE = "\x1b[?62;22c";
 const DA2_RESPONSE = "\x1b[>1;10;0c";
 
-pub fn respondToDeviceAttributes(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), data: []const u8) void {
+pub fn respondToDeviceAttributes(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), data: []const u8, max_bytes: usize) void {
     // Scan for DA queries in PTY output and respond on behalf of the terminal.
     // This handles the case where no client is attached (e.g. zmx run)
     // and the shell (e.g. fish) sends a DA query that would otherwise go unanswered.
@@ -348,9 +348,9 @@ pub fn respondToDeviceAttributes(alloc: std.mem.Allocator, buf: *std.ArrayList(u
                 continue;
             }
             if (matchSeq(data[i..], DA2_QUERY) or matchSeq(data[i..], DA2_QUERY_EXPLICIT)) {
-                buf.appendSlice(alloc, DA2_RESPONSE) catch {};
+                if (buf.items.len <= max_bytes and DA2_RESPONSE.len <= max_bytes - buf.items.len) buf.appendSlice(alloc, DA2_RESPONSE) catch {};
             } else if (matchSeq(data[i..], DA1_QUERY) or matchSeq(data[i..], DA1_QUERY_EXPLICIT)) {
-                buf.appendSlice(alloc, DA1_RESPONSE) catch {};
+                if (buf.items.len <= max_bytes and DA1_RESPONSE.len <= max_bytes - buf.items.len) buf.appendSlice(alloc, DA1_RESPONSE) catch {};
             }
         }
         i += 1;
@@ -381,7 +381,7 @@ pub fn rewritePromptRedraw(alloc: std.mem.Allocator, data: []const u8) ?[]const 
     if (std.mem.indexOf(u8, data, OSC_133_A) == null) return null;
 
     var result = std.ArrayList(u8).initCapacity(alloc, data.len + 200) catch return null;
-    errdefer result.deinit(alloc);
+    defer result.deinit(alloc);
     result.appendSlice(alloc, data) catch return null;
 
     // Work backwards so index shifts don't invalidate later positions.
@@ -431,7 +431,6 @@ pub fn rewritePromptRedraw(alloc: std.mem.Allocator, data: []const u8) ?[]const 
 
     // If nothing changed, free and return null.
     if (std.mem.eql(u8, result.items, data)) {
-        result.deinit(alloc);
         return null;
     }
 
@@ -830,32 +829,28 @@ pub fn isUserInput(payload: []const u8) bool {
 /// The NUL is not cosmetic: a client that records what it receives (kitty
 /// writing its session file, for one) persists the NUL and then fails to parse
 /// its own state back. See https://github.com/neurosnap/zmx/issues/222.
-fn writePwd(writer: *std.Io.Writer, term: *const ghostty_vt.Terminal) void {
+fn writePwd(writer: *std.Io.Writer, term: *const ghostty_vt.Terminal) !void {
     const pwd = term.getPwd() orelse return;
     if (pwd.len == 0) return;
-    writer.print("\x1b]7;{s}\x1b\\", .{pwd}) catch |err| {
-        std.log.warn("failed to format pwd err={s}", .{@errorName(err)});
-    };
+    try writer.print("\x1b]7;{s}\x1b\\", .{pwd});
 }
 
 fn writeDynamicColor(
     writer: *std.Io.Writer,
     kind: ghostty_vt.color.Dynamic,
     dynamic: ghostty_vt.color.DynamicRGB,
-) void {
+) !void {
     const c = dynamic.override orelse return;
-    writer.print("\x1b]{d};rgb:{x:0>2}/{x:0>2}/{x:0>2}\x1b\\", .{
+    try writer.print("\x1b]{d};rgb:{x:0>2}/{x:0>2}/{x:0>2}\x1b\\", .{
         @intFromEnum(kind), c.r, c.g, c.b,
-    }) catch |err| {
-        std.log.warn("failed to format dynamic color err={s}", .{@errorName(err)});
-    };
+    });
 }
 
-fn writeColorOverrides(writer: *std.Io.Writer, term: *const ghostty_vt.Terminal) void {
+fn writeColorOverrides(writer: *std.Io.Writer, term: *const ghostty_vt.Terminal) !void {
     const colors = &term.colors;
-    writeDynamicColor(writer, .foreground, colors.foreground);
-    writeDynamicColor(writer, .background, colors.background);
-    writeDynamicColor(writer, .cursor, colors.cursor);
+    try writeDynamicColor(writer, .foreground, colors.foreground);
+    try writeDynamicColor(writer, .background, colors.background);
+    try writeDynamicColor(writer, .cursor, colors.cursor);
 }
 
 pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal) ?[]const u8 {
@@ -872,8 +867,10 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
         term.modes.set(.synchronized_output, false);
     }
 
+    defer term.modes.set(.synchronized_output, had_synchronized_output);
+
     // If state contains color override, restore it.
-    writeColorOverrides(&builder.writer, term);
+    writeColorOverrides(&builder.writer, term) catch return null;
 
     const pages = &term.screens.active.pages;
     const screen_top = pages.getTopLeft(.screen);
@@ -909,13 +906,14 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
             scroll_fmt.extra = .none; // no modes, cursor, keyboard — just content
             scroll_fmt.format(&builder.writer) catch |err| {
                 std.log.warn("failed to format scrollback err={s}", .{@errorName(err)});
+                return null;
             };
         }
 
         // Clear visible screen after scrollback. \x1b[2J clears only the visible
         // rows (not the scrollback buffer). \x1b[H homes the cursor. \x1b[0m resets
         // SGR style so phase 1 styles don't bleed into phase 2.
-        builder.writer.writeAll("\x1b[2J\x1b[H\x1b[0m") catch {};
+        builder.writer.writeAll("\x1b[2J\x1b[H\x1b[0m") catch return null;
     }
 
     // Phase 2: visible screen with full extras (modes, cursor, keyboard, etc.)
@@ -956,7 +954,7 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
         return null;
     };
 
-    writePwd(&builder.writer, term);
+    writePwd(&builder.writer, term) catch return null;
 
     // The formatter has no title extra and never emits OSC 0/1/2, so the title
     // has to be replayed separately or an attaching client shows whatever its
@@ -965,16 +963,12 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
     if (term.getTitle()) |title| {
         builder.writer.print("\x1b]2;{s}\x07", .{title}) catch |err| {
             std.log.warn("failed to format title err={s}", .{@errorName(err)});
+            return null;
         };
     }
 
     const output = builder.writer.buffered();
     if (output.len == 0) return null;
-
-    // Restore the original synchronized_output mode before returning
-    if (had_synchronized_output) {
-        term.modes.set(.synchronized_output, true);
-    }
 
     return alloc.dupe(u8, output) catch |err| {
         std.log.warn("failed to allocate terminal state err={s}", .{@errorName(err)});
@@ -1046,7 +1040,7 @@ pub fn serializeTerminalRange(
         return null;
     };
 
-    if (format == .vt) writePwd(&builder.writer, term);
+    if (format == .vt) writePwd(&builder.writer, term) catch return null;
 
     const output = builder.writer.buffered();
     if (output.len == 0) return null;
@@ -2377,4 +2371,26 @@ test "isUserInput: kitty keyboard status reply is a terminal response" {
     try testing.expect(isUserInput("\x1b[?1u\r"));
     try testing.expect(isUserInput("\x1b[?1u\x1b[97;1u"));
     try testing.expect(!isUserInput("\x1b[?1u\x1b[97;1:3u"));
+}
+
+test "synthesized terminal replies respect the PTY queue byte budget" {
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    try buf.appendSlice(alloc, "keep");
+    respondToDeviceAttributes(alloc, &buf, "\x1b[c\x1b[>c", 5);
+    try std.testing.expectEqualStrings("keep", buf.items);
+    respondToDeviceAttributes(alloc, &buf, "\x1b[c", 128);
+    try std.testing.expect(buf.items.len > 4);
+    try std.testing.expect(buf.items.len <= 128);
+}
+
+test "failed Restore serialization preserves synchronized-output mode" {
+    const alloc = std.testing.allocator;
+    var term = try ghostty_vt.Terminal.init(std.testing.io, alloc, .{ .cols = 80, .rows = 24 });
+    defer term.deinit(alloc);
+    term.modes.set(.synchronized_output, true);
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectEqual(@as(?[]const u8, null), serializeTerminalState(failing.allocator(), &term));
+    try std.testing.expect(term.modes.get(.synchronized_output));
 }
