@@ -16,6 +16,7 @@ const loop = @import("loop.zig");
 const create = @import("create.zig");
 const discover = @import("discover.zig");
 const exit_record = @import("exit_record.zig");
+const migrate_proto = @import("migrate.zig");
 const Client = loop.Client;
 const Daemon = loop.Daemon;
 const version = build_options.version;
@@ -71,6 +72,31 @@ pub fn main(init: std.process.Init) !void {
         return printVersion(io, &cfg);
     } else if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "h") or std.mem.eql(u8, cmd, "-h")) {
         return help(io);
+    } else if (std.mem.eql(u8, cmd, migrate_proto.import_subcommand)) {
+        // Not a command anyone types: a daemon handing its session on runs
+        // this binary with it, and the two arguments are meaningless without
+        // that daemon waiting on the other end. Deliberately absent from
+        // help and completions.
+        const handoff_path = args.next() orelse return error.MigrateSocketRequired;
+        const token = args.next() orelse return error.MigrateTokenRequired;
+        return loop.runImported(gpa, io, &cfg, handoff_path, token);
+    } else if (std.mem.eql(u8, cmd, "migrate")) {
+        var session_name: ?[]const u8 = null;
+        var target: ?[]const u8 = null;
+        while (args.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+                return help(io);
+            } else if (std.mem.eql(u8, arg, "--to")) {
+                target = args.next() orelse return usageError(io, "--to requires a path to a zmx binary");
+            } else if (session_name == null) {
+                session_name = arg;
+            } else {
+                return usageError(io, "migrate takes one session name");
+            }
+        }
+        const sesh = try socket.resolveSessionOrEnv(gpa, io, session_name);
+        defer gpa.free(sesh);
+        return migrateSession(gpa, io, &cfg, sesh, target);
     } else if (std.mem.eql(u8, cmd, "list") or std.mem.eql(u8, cmd, "l") or std.mem.eql(u8, cmd, "ls")) {
         var list_args: std.ArrayList([]const u8) = .empty;
         defer list_args.deinit(gpa);
@@ -618,6 +644,7 @@ fn help(io: std.Io) !void {
         \\  [cl]ear <name>                                             Clear all session labels
         \\  print-env [-s] <name> [key]                                Print tracked environment variables
         \\  [k]ill <name>... [--force]                                 Kill session and all attached clients
+        \\  migrate <name> [--to <zmx>]              Hand the session to another zmx build
         \\  [hi]story <name> [--vt|--html] [--screen|--scrollback]     Output session scrollback
         \\  [w]ait <name>...                                           Wait for session tasks to complete
         \\  [t]ail <name>...                                           Follow session output
@@ -628,6 +655,16 @@ fn help(io: std.Io) !void {
         \\Attach:
         \\  This will spawn a login $SHELL with a PTY.  You can provide a
         \\  command instead of creating a shell.
+        \\
+        \\Migrate:
+        \\  Hands a running session to another zmx binary -- by default the
+        \\  one running this command -- so an upgrade replaces the daemon
+        \\  without restarting the child. The pty and the listening socket
+        \\  cross to the new daemon, which replays the terminal as it stands.
+        \\  Attached clients are dropped, exactly as a detach drops them, and
+        \\  it is up to each one whether it attaches again. The new daemon did not
+        \\  fork the child, so from then on the session reports that the child
+        \\  ended without reporting its exit code.
         \\
         \\Create:
         \\  For programs that own sessions. Unlike attach it never attaches to
@@ -1286,6 +1323,99 @@ fn kill(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u
     try w.interface.flush();
 }
 
+/// Asks a session's daemon to hand itself to another build of zmx.
+///
+/// The target defaults to the binary running this command, which is what an
+/// upgrade looks like from the outside: install the new zmx, run its
+/// `migrate` for each session, and the children never notice. The daemon
+/// does the work; this waits for its answer and reports it.
+fn migrateSession(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    cfg: *Cfg,
+    session_name: []const u8,
+    target: ?[]const u8,
+) !void {
+    var out_buf: [4096]u8 = undefined;
+    var err_buf: [4096]u8 = undefined;
+    var out = std.Io.File.stdout().writerStreaming(io, &out_buf);
+    var err_out = std.Io.File.stderr().writerStreaming(io, &err_buf);
+
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe = migrate_proto.resolveExe(target, &exe_buf) catch |e| {
+        try err_out.interface.print(
+            "error: cannot resolve the zmx to migrate to: {s}\n",
+            .{@errorName(e)},
+        );
+        try err_out.interface.flush();
+        std.process.exit(1);
+    };
+
+    const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, session_name) catch |e| switch (e) {
+        error.NameTooLong => return socket.printSessionNameTooLong(io, session_name, cfg.socket_dir),
+        error.OutOfMemory => return e,
+    };
+    defer alloc.free(socket_path);
+
+    const fd = ipc.connectSession(socket_path) catch |e| {
+        try err_out.interface.print(
+            "error: session \"{s}\" not found or unresponsive ({s})\n",
+            .{ session_name, @errorName(e) },
+        );
+        try err_out.interface.flush();
+        std.process.exit(1);
+    };
+    defer lib_posix.close(fd);
+
+    std.log.info("migrate session={s} to exe={s}", .{ session_name, exe });
+    try ipc.send(fd, .Migrate, exe);
+
+    var sb = try ipc.SocketBuffer.init(alloc);
+    defer sb.deinit();
+    var poll_fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
+    // Comfortably longer than the daemon's own worst case, which is a handful
+    // of bounded steps: if this expires, the daemon is not merely slow, and
+    // saying so is better than reporting a refusal it never made.
+    const budget_ms: i32 = 60_000;
+    var waited_ms: i32 = 0;
+    while (waited_ms < budget_ms) {
+        const ready = lib_posix.poll(&poll_fds, 250) catch break;
+        waited_ms += 250;
+        if (ready == 0) continue;
+        const n = sb.read(fd) catch break;
+        if (n == 0) break;
+        while (sb.next()) |msg| {
+            if (msg.header.tag != .MigrateAck) continue;
+            const status: u8 = if (msg.payload.len > 0) msg.payload[0] else migrate_proto.ack_refused;
+            const detail = if (msg.payload.len > 1) msg.payload[1..] else "";
+            if (status == migrate_proto.ack_ok) {
+                try out.interface.print("migrated session {s} to {s}\n", .{ session_name, detail });
+                try out.interface.flush();
+                return;
+            }
+            try err_out.interface.print(
+                "error: session \"{s}\" refused to migrate: {s}\n",
+                .{ session_name, detail },
+            );
+            try err_out.interface.flush();
+            std.process.exit(1);
+        }
+    }
+
+    // A daemon ignores a tag it does not know, so silence is what a session
+    // started by a zmx without handoffs looks like. It is not the only thing
+    // silence can mean, though, and the others are not knowable from here --
+    // so this says what was observed and where to look, rather than promising
+    // a session it cannot see is untouched.
+    try err_out.interface.print(
+        "error: session \"{s}\" did not answer within {d}s; it may predate `migrate`.\n" ++
+            "Check it with `zmx inspect {s}` before assuming either way.\n",
+        .{ session_name, @divTrunc(budget_ms, 1000), session_name },
+    );
+    try err_out.interface.flush();
+    std.process.exit(1);
+}
+
 fn printLabelError(io: std.Io, session_name: []const u8, err: anyerror) noreturn {
     var buf: [4096]u8 = undefined;
     var w = std.Io.File.stderr().writerStreaming(io, &buf);
@@ -1836,6 +1966,21 @@ fn attach(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, env_str: []const 
             // where before the child's exit code was simply lost.
             if (looper.exit) |status| {
                 _ = lib_posix.write(lib_posix.STDOUT_FILENO, restore_seq) catch {};
+                if (!status.status_known) {
+                    // The session was handed to a daemon that had not forked
+                    // the child, so nothing in this chain of processes ever
+                    // learned its status. Said out loud rather than worn:
+                    // exiting 0 would claim a success nobody observed, and
+                    // exiting non-zero would claim a failure just as blindly.
+                    var buf: [256]u8 = undefined;
+                    var w = std.Io.File.stderr().writerStreaming(io, &buf);
+                    w.interface.print(
+                        "zmx: session \"{s}\" ended; its exit status is unknown after a migration\n",
+                        .{daemon.session_name},
+                    ) catch {};
+                    w.interface.flush() catch {};
+                    std.process.exit(0);
+                }
                 if (status.signal != 0) std.process.exit(128 +| status.signal);
                 std.process.exit(status.code);
             }

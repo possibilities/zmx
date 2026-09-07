@@ -22,8 +22,13 @@ pub const Record = struct {
     pid: i32,
     createdAt: u64,
     endedAt: u64,
-    code: u8,
-    signal: u8,
+    /// Null when the daemon could not observe how the child ended: after a
+    /// handoff it is no longer the child's parent, so it learns that the
+    /// session ended without learning its status. A reader that wants a
+    /// number must decide what an unknown one means to it; writing a zero
+    /// here would have made a failure look like a success.
+    code: ?u8,
+    signal: ?u8,
     reason: []const u8,
     /// `k=v k=v`, the form labels travel in everywhere else.
     labels: []const u8 = "",
@@ -176,6 +181,49 @@ test "exit record: encodes the shape a supervisor reads" {
         "{\"name\":\"fmx-abc\",\"pid\":77,\"createdAt\":1700000000,\"endedAt\":1700000042,\"code\":7,\"signal\":0,\"reason\":\"natural\",\"labels\":\"instance=abc owner=fmx\"}\n",
         w.buffered(),
     );
+}
+
+test "exit record: an unobserved status is null, not a zero" {
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try encode(&w, .{
+        .name = "fmx-abc",
+        .pid = 77,
+        .createdAt = 1700000000,
+        .endedAt = 1700000042,
+        .code = null,
+        .signal = null,
+        .reason = "natural",
+    });
+    try std.testing.expectEqualStrings(
+        "{\"name\":\"fmx-abc\",\"pid\":77,\"createdAt\":1700000000,\"endedAt\":1700000042,\"code\":null,\"signal\":null,\"reason\":\"natural\",\"labels\":\"\"}\n",
+        w.buffered(),
+    );
+}
+
+test "exit record: a record written with a null status reads back as one" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try write(io, tmp.dir, 0o750, 0o640, .{
+        .name = "migrated",
+        .pid = 5,
+        .createdAt = 1,
+        .endedAt = 2,
+        .code = null,
+        .signal = null,
+        .reason = "natural",
+    });
+    var parsed = try read(gpa, io, tmp.dir, "migrated");
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?u8, null), parsed.value.code);
+    try std.testing.expectEqual(@as(?u8, null), parsed.value.signal);
+    try std.testing.expectEqualStrings("natural", parsed.value.reason);
 }
 
 test "exit record: write, read, list, remove, on a real directory" {

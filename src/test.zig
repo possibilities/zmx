@@ -11,4 +11,5 @@ comptime {
     _ = @import("create.zig");
     _ = @import("discover.zig");
     _ = @import("exit_record.zig");
+    _ = @import("migrate.zig");
 }

@@ -11,6 +11,7 @@ const Cfg = @import("cfg.zig");
 const signal = @import("signal.zig");
 const assert = std.debug.assert;
 const daemonize = @import("daemonize.zig");
+const migrate = @import("migrate.zig");
 const exit_record = @import("exit_record.zig");
 const builtin = @import("builtin");
 
@@ -280,6 +281,7 @@ pub fn clientLoop(io: std.Io, client_sock_fd: i32, stdin_is_tty: bool, env_str: 
 }
 
 fn initTerminal(gpa: std.mem.Allocator, io: std.Io, size: ipc.Resize, cfg: *const Cfg) !ghostty_vt.Terminal {
+    try validateTerminalSize(size);
     return ghostty_vt.Terminal.init(io, gpa, .{
         .cols = size.cols,
         .rows = size.rows,
@@ -288,9 +290,21 @@ fn initTerminal(gpa: std.mem.Allocator, io: std.Io, size: ipc.Resize, cfg: *cons
     });
 }
 
+/// Build a shadow terminal before the loop so a handoff can restore it.
+fn newTerminal(io: std.Io, gpa: std.mem.Allocator, cfg: *Cfg, pty_fd: i32) !ghostty_vt.Terminal {
+    return initTerminal(gpa, io, ipc.getTerminalSize(pty_fd), cfg);
+}
+
 /// dameonLoop is what the daemon runs to send and receive ipc commands from its corresponding
 /// clients.  It uses poll() as its non-blocking mechanism.
-fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_fd: lib_posix.socket_t, pty_fd: i32) !void {
+fn daemonLoop(
+    daemon: *Daemon,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    server_sock_fd: lib_posix.socket_t,
+    pty_fd: i32,
+    term: *ghostty_vt.Terminal,
+) !void {
     std.log.info("daemon started session={s} pty_fd={d}", .{ daemon.session_name, pty_fd });
 
     try signal.openSignalPipe();
@@ -298,10 +312,6 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
     var poll_fds = try std.ArrayList(lib_posix.pollfd).initCapacity(gpa, 8);
     defer poll_fds.deinit(gpa);
 
-    const init_size = ipc.getTerminalSize(pty_fd);
-    try validateTerminalSize(init_size);
-    var term = try initTerminal(gpa, io, init_size, daemon.cfg);
-    defer term.deinit(gpa);
     var vt_stream = term.vtStream();
     defer vt_stream.deinit();
 
@@ -325,7 +335,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
         while (closing > 0) {
             closing -= 1;
             const client = daemon.clients.items[closing];
-            if (client.disconnect and daemon.closeClient(gpa, client, closing, pty_fd, &term)) break :daemon_loop;
+            if (client.disconnect and daemon.closeClient(gpa, client, closing, pty_fd, term)) break :daemon_loop;
         }
         // If the program asked for focus reports (DECSET 1004), send focus-out
         // when the last attached client leaves and focus-in when one returns,
@@ -446,7 +456,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                 } else {
                     // Feed PTY output to terminal emulator for state tracking
                     vt_stream.nextSlice(buf[0..n]);
-                    daemon.setPwd(&term);
+                    daemon.setPwd(term);
                     daemon.has_pty_output = true;
 
                     // When no real terminal client has attached yet, respond to
@@ -551,14 +561,14 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         "client read err={s} fd={d}",
                         .{ @errorName(err), client.socket_fd },
                     );
-                    const last = daemon.closeClient(gpa, client, i, pty_fd, &term);
+                    const last = daemon.closeClient(gpa, client, i, pty_fd, term);
                     if (last) break :daemon_loop;
                     continue;
                 };
 
                 if (n == 0) {
                     // Client closed connection
-                    const last = daemon.closeClient(gpa, client, i, pty_fd, &term);
+                    const last = daemon.closeClient(gpa, client, i, pty_fd, term);
                     if (last) break :daemon_loop;
                     continue;
                 }
@@ -569,14 +579,14 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     // acted on, least of all Input reaching the PTY.
                     if (client.phase == .rejected or client.disconnect) break;
                     const handled: anyerror!void = switch (msg.header.tag) {
-                        .Input => daemon.handleInput(gpa, client, pty_fd, &term, msg.payload),
+                        .Input => daemon.handleInput(gpa, client, pty_fd, term, msg.payload),
                         .Send => daemon.handleSend(gpa, msg.payload),
-                        .Output => daemon.handleOutput(gpa, msg.payload, &term, &vt_stream),
-                        .Init => daemon.handleInit(gpa, client, pty_fd, &term, msg.payload),
+                        .Output => daemon.handleOutput(gpa, msg.payload, term, &vt_stream),
+                        .Init => daemon.handleInit(gpa, client, pty_fd, term, msg.payload),
                         .Switch => daemon.handleSwitch(gpa, msg.payload),
-                        .Resize => daemon.handleResize(gpa, client, pty_fd, &term, msg.payload),
+                        .Resize => daemon.handleResize(gpa, client, pty_fd, term, msg.payload),
                         .Detach => {
-                            const last = daemon.handleDetach(gpa, client, i, pty_fd, &term);
+                            const last = daemon.handleDetach(gpa, client, i, pty_fd, term);
                             if (last) break :daemon_loop;
                             break :clients_loop;
                         },
@@ -601,18 +611,36 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                                 draining_until = std.Io.Timestamp.now(io, .boot).toMilliseconds() + drain_grace_ms;
                             }
                         },
-                        .Info => daemon.handleInfo(gpa, client, &term),
+                        .Info => daemon.handleInfo(gpa, client, term),
                         .LabelGet => daemon.handleLabelGet(gpa, client),
                         .LabelSet => daemon.handleLabelSet(gpa, client, msg.payload),
                         .LabelClear => daemon.handleLabelClear(gpa, client),
                         .EnvGet => daemon.handleEnvGet(gpa, client),
                         .EnvSet => daemon.handleEnvSet(gpa, client, msg.payload),
-                        .History => daemon.handleHistory(gpa, client, &term, msg.payload),
-                        .Capture => daemon.handleCapture(gpa, client, &term, msg.payload),
+                        .Capture => daemon.handleCapture(gpa, client, term, msg.payload),
+                        .History => daemon.handleHistory(gpa, client, term, msg.payload),
                         .Run => daemon.handleRun(gpa, io, client, msg.payload),
                         // Frames a daemon never receives: these travel the
                         // other way, and a client sending one says nothing.
-                        .Ack, .TaskComplete, .LabelData, .EnvData, .Welcome, .RestoreBegin, .Ready, .Exit => {},
+                        .Ack, .TaskComplete, .LabelData, .EnvData, .Welcome, .RestoreBegin, .Ready, .Exit, .MigrateAck => {},
+                        .Migrate => {
+                            // The parser, unlike the Terminal, owns unfinished
+                            // escape sequences and UTF-8 codepoints. Leave the
+                            // source in charge until those bytes are complete.
+                            if (vt_stream.parser.state != .ground or vt_stream.utf8decoder.state != 0) {
+                                daemon.ackMigrate(gpa, client, migrate.ack_refused, "terminal output sequence is incomplete; retry after more output");
+                                break;
+                            }
+                            if (daemon.handleMigrate(
+                                gpa,
+                                client,
+                                term,
+                                server_sock_fd,
+                                pty_fd,
+                                msg.payload,
+                                draining_until != null,
+                            )) break :daemon_loop;
+                        },
                         .Write => daemon.handleWrite(gpa, client, msg.payload),
                         .Hello => daemon.handleHello(gpa, client, msg.payload),
                         _ => std.log.warn(
@@ -622,7 +650,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     };
                     handled catch |err| {
                         std.log.warn("refusing client command tag={d} err={s}", .{ @intFromEnum(msg.header.tag), @errorName(err) });
-                        const last = daemon.closeClient(gpa, client, i, pty_fd, &term);
+                        const last = daemon.closeClient(gpa, client, i, pty_fd, term);
                         if (last) break :daemon_loop;
                         continue :clients_loop;
                     };
@@ -635,7 +663,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                 const n = lib_posix.write(client.socket_fd, client.write_buf.items) catch |err| blk: {
                     if (err == error.WouldBlock) break :blk 0;
                     // Error on write, close client
-                    const last = daemon.closeClient(gpa, client, i, pty_fd, &term);
+                    const last = daemon.closeClient(gpa, client, i, pty_fd, term);
                     if (last) break :daemon_loop;
                     continue;
                 };
@@ -647,7 +675,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                 if (client.write_buf.items.len == 0) {
                     client.has_pending_output = false;
                     if (client.phase == .rejected) {
-                        const last = daemon.closeClient(gpa, client, i, pty_fd, &term);
+                        const last = daemon.closeClient(gpa, client, i, pty_fd, term);
                         if (last) break :daemon_loop;
                         continue;
                     }
@@ -655,7 +683,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
             }
 
             if (revents & (lib_posix.POLL.HUP | lib_posix.POLL.ERR | lib_posix.POLL.NVAL) != 0) {
-                const last = daemon.closeClient(gpa, client, i, pty_fd, &term);
+                const last = daemon.closeClient(gpa, client, i, pty_fd, term);
                 if (last) break :daemon_loop;
             }
         }
@@ -682,6 +710,166 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
             }
         }
     }
+}
+
+/// The receiving side of a handoff: this process was executed by a daemon
+/// that is about to stop being a session, and becomes that session itself.
+///
+/// It is already detached. The daemon that spawned it is deliberately not a
+/// session leader -- `daemonize` gives that up so no zmx process can acquire
+/// a controlling terminal -- so a child of one cannot acquire one either, and
+/// its stdio was pointed at /dev/null before the exec.
+///
+/// Nothing here reaches the session until the whole exchange has succeeded:
+/// the socket, the pty, and the child stay the source daemon's until it says
+/// the word, and every failure before that simply exits and leaves the
+/// session where it was.
+pub fn runImported(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    cfg: *Cfg,
+    handoff_path: []const u8,
+    token: []const u8,
+) !void {
+    const conn = try socket.sessionConnect(handoff_path);
+    var conn_open = true;
+    defer if (conn_open) lib_posix.close(conn);
+    try migrate.setNonBlocking(conn);
+
+    try migrate.writeExact(conn, token, migrate.step_timeout_ms);
+    const bytes = migrate.readManifest(gpa, conn) catch |err| {
+        // Same courtesy as a manifest we can read but not understand: the
+        // source learns now and keeps its session, instead of waiting out a
+        // timeout and reporting it as a transport failure.
+        migrate.sendWord(conn, migrate.word_refused) catch {};
+        return err;
+    };
+    // Held for the whole session: the manifest's strings are what the daemon
+    // below is built out of, and copying each one would buy nothing.
+    defer gpa.free(bytes);
+    const m = migrate.decodeManifest(bytes) catch |err| {
+        // Said out loud, so a source handing us something we cannot read
+        // learns it now and keeps its session, rather than waiting out the
+        // timeout.
+        migrate.sendWord(conn, migrate.word_refused) catch {};
+        return err;
+    };
+    // The target's build defaults can name a different Home. It must never
+    // serve the source descriptor but later unlink a target-Home session.
+    const expected_socket = try socket.getSocketPath(gpa, cfg.socket_dir, m.session_name);
+    defer gpa.free(expected_socket);
+    if (!std.mem.eql(u8, expected_socket, m.socket_path)) {
+        migrate.sendWord(conn, migrate.word_refused) catch {};
+        return error.HandoffDirectoryMismatch;
+    }
+    try migrate.sendWord(conn, migrate.word_validated);
+
+    var fds: [2]lib_posix.fd_t = undefined;
+    try migrate.waitReadable(conn, migrate.step_timeout_ms);
+    const fd_count = try lib_posix.recvFds(conn, &fds);
+    if (fd_count != 2) return error.NoDescriptors;
+    const master_fd = fds[0];
+    const server_sock_fd = fds[1];
+
+    // The session keeps the scrollback it was created with, whatever this
+    // process's own environment says.
+    cfg.max_scrollback_lines = @intCast(m.max_scrollback_lines);
+
+    const session_name = try gpa.dupe(u8, m.session_name);
+    const socket_path = try gpa.dupe(u8, m.socket_path);
+    var daemon = Daemon.init(io, cfg, session_name, socket_path);
+    daemon.pid = m.pid;
+    // The pty crossed a socket; parenthood did not.
+    daemon.child_is_ours = false;
+    daemon.created_at = m.created_at;
+    daemon.terminal_activity_sequence = m.terminal_activity_sequence;
+    daemon.has_pty_output = m.has(migrate.flag_has_pty_output);
+    daemon.has_had_client = m.has(migrate.flag_has_had_client);
+    // Terminal membership is derived from current clients; none cross handoff.
+    daemon.exit_on_last_client = m.has(migrate.flag_exit_on_last_client);
+    // Deliberately not armed from the manifest, though the manifest says what
+    // the source had. The policy ends a session when its last attached
+    // terminal disconnects, and this daemon has never had one: arming it here
+    // would assert a client that only the previous daemon ever saw. Left
+    // disarmed, the session is in exactly the state a freshly created
+    // `--exit-on-last-client` session is in before its first attach, which is
+    // a state the policy already defines -- it arms on the first valid Init,
+    // so the next terminal to attach and leave ends the session as asked.
+    daemon.exit_on_last_client_armed = false;
+    daemon.record_exit = m.has(migrate.flag_record_exit);
+    daemon.is_task_mode = m.has(migrate.flag_is_task_mode);
+    daemon.task_id = m.task_id;
+    if (m.has(migrate.flag_has_task_exit_code)) daemon.task_exit_code = m.task_exit_code;
+    if (m.has(migrate.flag_has_task_ended_at)) daemon.task_ended_at = m.task_ended_at;
+    if (m.shell.len > 0) daemon.shell = m.shell;
+    if (m.has(migrate.flag_has_command)) daemon.command = try migrate.splitCommand(gpa, m.command);
+    if (m.cwd.len > 0) daemon.setCwd(m.cwd);
+    if (m.labels.len > 0) try daemon.applyLabels(gpa, m.labels);
+    if (m.pty_input.len > 0) try daemon.queuePtyInput(gpa, m.pty_input);
+
+    { // the session's own log, continued rather than started over
+        log.log_system.deinit();
+        var log_buf: [4096]u8 = undefined;
+        const session_log_name = try std.fmt.bufPrint(&log_buf, "{s}.log", .{session_name});
+        var fba_buf: [4096]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
+        const session_log_path = try std.fs.path.join(
+            fba.allocator(),
+            &.{ cfg.log_dir, session_log_name },
+        );
+        const log_mode = std.Io.File.Permissions.fromMode(@intCast(cfg.log_mode));
+        log.log_system.init(io, session_log_path, log_mode) catch {};
+    }
+    std.log.info(
+        "importing session={s} pid={d} protocol={d} snapshot={d}B",
+        .{ session_name, m.pid, m.protocol_version, m.snapshot.len },
+    );
+
+    // Built and filled before anything is claimed: a client attaching after
+    // the swap must find the screen the previous daemon was showing, so the
+    // restore has to be real by the time this side says it is restored.
+    var term = try newTerminal(io, gpa, cfg, master_fd);
+    defer term.deinit(gpa);
+    if (m.snapshot.len > 0) {
+        var restore_stream = term.vtStream();
+        defer restore_stream.deinit();
+        restore_stream.nextSlice(m.snapshot);
+    }
+    if (term.screens.get(.primary)) |screen| {
+        screen.cursor.pending_wrap = m.has(migrate.flag_primary_pending_wrap);
+        if (screen.saved_cursor) |*saved| saved.pending_wrap = m.has(migrate.flag_primary_saved_wrap);
+    }
+    if (term.screens.get(.alternate)) |screen| {
+        screen.cursor.pending_wrap = m.has(migrate.flag_alternate_pending_wrap);
+        if (screen.saved_cursor) |*saved| saved.pending_wrap = m.has(migrate.flag_alternate_saved_wrap);
+    }
+
+    var dir = try std.Io.Dir.openDirAbsolute(io, cfg.socket_dir, .{});
+    defer dir.close(io);
+    const socket_inode: ?std.Io.File.INode = if (dir.statFile(io, session_name, .{})) |st|
+        st.inode
+    else |_|
+        null;
+
+    try migrate.sendWord(conn, migrate.word_restored);
+    try migrate.awaitWord(conn, migrate.word_committed, migrate.step_timeout_ms);
+    // From here the session is this process's, and the source is leaving.
+    migrate.sendWord(conn, migrate.word_owned) catch {};
+    lib_posix.close(conn);
+    conn_open = false;
+
+    defer daemon.teardownSession(gpa, io, dir, session_name, .{
+        .server_sock_fd = server_sock_fd,
+        .socket_inode = socket_inode,
+        .master_fd = master_fd,
+    });
+
+    std.log.info("imported session={s}", .{session_name});
+    daemonLoop(&daemon, gpa, io, server_sock_fd, master_fd, &term) catch |err| {
+        if (daemon.exit_reason == .natural) daemon.exit_reason = .daemon_failure;
+        return err;
+    };
+    std.log.info("daemon loop shutdown after import session={s}", .{session_name});
 }
 
 const ClientResult = struct {
@@ -858,6 +1046,16 @@ pub const Daemon = struct {
     /// without reaping, so the zombie keeps its pid and process group pinned
     /// until teardown has finished using both.
     child_status: ?ipc.Exit = null,
+    /// Whether this daemon forked the child it holds. False for a session
+    /// received in a handoff: the pty crossed a socket, so the child is
+    /// attached to this daemon's terminal but parented to init. Nothing may
+    /// wait for it, and its end is observed by asking whether its pid still
+    /// answers -- which says that it ended, never how.
+    child_is_ours: bool = true,
+    /// Set once another daemon has taken this session over. From then on the
+    /// socket, the pty, and the child belong to that daemon, and this one
+    /// leaves without touching any of them.
+    handed_off: bool = false,
     /// Why the session is ending. A kill request sets it before the child
     /// dies, so the exit the client receives says who caused it.
     exit_reason: ipc.Exit.Reason = .natural,
@@ -1056,6 +1254,97 @@ pub const Daemon = struct {
         return self.run(io, dir, self.session_name);
     }
 
+    /// What a daemon holds for exactly as long as it is the session.
+    pub const SessionFds = struct {
+        server_sock_fd: lib_posix.socket_t,
+        /// Which socket file is ours, so the teardown can tell whether the
+        /// name was taken over while it slept and leave a successor's alone.
+        socket_inode: ?std.Io.File.INode,
+        master_fd: i32,
+    };
+
+    /// Ends the session: everything a daemon must undo before it exits,
+    /// whichever way the loop came to a stop.
+    fn teardownSession(
+        self: *Daemon,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        dir: std.Io.Dir,
+        sesh_name: []const u8,
+        fds: SessionFds,
+    ) void {
+        // A session that was handed to another daemon has not ended. That
+        // daemon is holding this socket, this pty, and this child, and every
+        // line below would take one of them away from it -- so none of them
+        // run, and the descriptors go with the exit that follows.
+        if (self.handed_off) {
+            std.log.info(
+                "handed off session={s}; the new daemon owns it from here",
+                .{sesh_name},
+            );
+            return;
+        }
+        // Closed first: from here a connect is refused, which every
+        // caller reads as "gone", and nothing can hang on the backlog
+        // during handleKill()'s 500 ms grace. The file itself stays
+        // until the exit record is written, so a name is never absent
+        // without its record: a supervisor that polls sees live,
+        // refused, exited -- never a gap it could read as "nothing".
+        lib_posix.close(fds.server_sock_fd);
+        // Asked once more before anything is signalled, and only for an
+        // adopted child. A child this daemon forked is a zombie until the
+        // reap below, so its pid and process group are pinned and the
+        // signals are certain to reach it. An adopted one is pinned by
+        // nothing: init reaped it the moment it died, and the number may
+        // already name a stranger. This is what lets `handleKill` know it
+        // has nothing to signal, which is the only way to be sure the
+        // signals below are aimed at this session and not at whoever
+        // inherited its pid.
+        if (!self.child_is_ours and self.child_status == null) {
+            self.child_status = self.observeChild();
+        }
+        // The process group is signalled either way: a child whose status
+        // was observed may have left background processes behind. The
+        // observed child itself is still a zombie, because waitid's
+        // WNOWAIT keeps its pid and process group pinned until after those
+        // signals. Every path then reaps that exact child once.
+        self.handleKill(gpa, io);
+        if (self.child_is_ours) {
+            const waited = lib_posix.waitpid(self.pid, 0);
+            if (waited.pid == self.pid and self.child_status == null) {
+                self.child_status = ipc.exitFromWaitStatus(waited.status, self.exit_reason);
+            }
+        } else if (self.child_status == null) {
+            // An adopted child is not ours to wait for -- `waitpid` would be
+            // asking about someone else's -- so the session ends saying that
+            // it ended without saying how.
+            self.child_status = .{ .reason = self.exit_reason, .status_known = false };
+        }
+        // A caller that swept our refused socket and recreated the name
+        // owns it now. Its record would be ours to overwrite and its
+        // socket ours to delete: neither happens. A socket merely swept
+        // -- nothing at the name -- takes nothing from the exit: the
+        // record is what a sweeper comes back for.
+        const name_state: enum { ours, swept, taken } = blk: {
+            const st = dir.statFile(io, sesh_name, .{}) catch |err| switch (err) {
+                error.FileNotFound => break :blk .swept,
+                else => break :blk .taken,
+            };
+            break :blk if (fds.socket_inode != null and st.inode == fds.socket_inode.?) .ours else .taken;
+        };
+        if (name_state != .taken and self.record_exit) self.writeExitRecord(gpa, io, dir);
+        if (name_state == .ours) {
+            std.log.info("deleting socket file session={s}", .{sesh_name});
+            dir.deleteFile(io, sesh_name) catch |err| {
+                std.log.warn("failed to delete socket file err={s}", .{@errorName(err)});
+            };
+        } else if (name_state == .taken) {
+            std.log.info("session name taken over during teardown; leaving it session={s}", .{sesh_name});
+        }
+        self.deinit(gpa);
+        lib_posix.close(fds.master_fd);
+    }
+
     /// Leaves how the session ended on disk. Best effort: the session is
     /// over either way, and a record that could not be written is logged,
     /// not fatal.
@@ -1068,8 +1357,10 @@ pub const Daemon = struct {
             .pid = self.pid,
             .createdAt = self.created_at,
             .endedAt = @intCast(std.Io.Timestamp.now(io, .real).toSeconds()),
-            .code = status.code,
-            .signal = status.signal,
+            // A status nobody could observe is written as null rather than
+            // as the zero the struct happens to hold.
+            .code = if (status.status_known) status.code else null,
+            .signal = if (status.status_known) status.signal else null,
             .reason = exit_record.reasonName(status.reason),
             .labels = labels,
         }) catch |err| {
@@ -1242,48 +1533,11 @@ pub const Daemon = struct {
             break :blk std.heap.c_allocator;
         };
 
-        defer {
-            // Closed first: from here a connect is refused, which every
-            // caller reads as "gone", and nothing can hang on the backlog
-            // during handleKill()'s 500 ms grace. The file itself stays
-            // until the exit record is written, so a name is never absent
-            // without its record: a supervisor that polls sees live,
-            // refused, exited -- never a gap it could read as "nothing".
-            lib_posix.close(server_sock_fd);
-            // The process group is signalled either way: a child whose status
-            // was observed may have left background processes behind. The
-            // observed child itself is still a zombie, because waitid's
-            // WNOWAIT keeps its pid and process group pinned until after those
-            // signals. Every path then reaps that exact child once.
-            self.handleKill(gpa, new_io);
-            const waited = lib_posix.waitpid(self.pid, 0);
-            if (waited.pid == self.pid and self.child_status == null) {
-                self.child_status = ipc.exitFromWaitStatus(waited.status, self.exit_reason);
-            }
-            // A caller that swept our refused socket and recreated the name
-            // owns it now. Its record would be ours to overwrite and its
-            // socket ours to delete: neither happens. A socket merely swept
-            // -- nothing at the name -- takes nothing from the exit: the
-            // record is what a sweeper comes back for.
-            const name_state: enum { ours, swept, taken } = blk: {
-                const st = dir.statFile(new_io, sesh_name, .{}) catch |err| switch (err) {
-                    error.FileNotFound => break :blk .swept,
-                    else => break :blk .taken,
-                };
-                break :blk if (socket_inode != null and st.inode == socket_inode.?) .ours else .taken;
-            };
-            if (name_state != .taken and self.record_exit) self.writeExitRecord(gpa, new_io, dir);
-            if (name_state == .ours) {
-                std.log.info("deleting socket file session={s}", .{sesh_name});
-                dir.deleteFile(new_io, sesh_name) catch |err| {
-                    std.log.warn("failed to delete socket file err={s}", .{@errorName(err)});
-                };
-            } else if (name_state == .taken) {
-                std.log.info("session name taken over during teardown; leaving it session={s}", .{sesh_name});
-            }
-            self.deinit(gpa);
-            lib_posix.close(pty_info.master_fd);
-        }
+        defer self.teardownSession(gpa, new_io, dir, sesh_name, .{
+            .server_sock_fd = server_sock_fd,
+            .socket_inode = socket_inode,
+            .master_fd = pty_info.master_fd,
+        });
 
         // Born labelled: applied with the daemon's own allocator, before the
         // loop accepts a client, so there is no window in which the session
@@ -1291,7 +1545,10 @@ pub const Daemon = struct {
         // here still removes the socket and takes the child down.
         if (self.initial_labels) |kvs| try self.applyLabels(gpa, kvs);
 
-        daemonLoop(self, gpa, new_io, server_sock_fd, pty_info.master_fd) catch |err| {
+        var term = try newTerminal(new_io, gpa, self.cfg, pty_info.master_fd);
+        defer term.deinit(gpa);
+
+        daemonLoop(self, gpa, new_io, server_sock_fd, pty_info.master_fd, &term) catch |err| {
             // The daemon could not go on; the child is taken down with it.
             // Said so in the record, before the teardown above runs.
             if (self.exit_reason == .natural) self.exit_reason = .daemon_failure;
@@ -1614,6 +1871,30 @@ pub const Daemon = struct {
     /// frames it takes, so scrollback is not capped by the frame size.
     const RESTORE_CHUNK = 1024 * 1024;
 
+    /// What is known about the child's end, or null while it still lives.
+    ///
+    /// A child this daemon forked answers precisely, through `waitid`. An
+    /// adopted one cannot: signal 0 asks only whether the pid still exists.
+    /// That question is asked only once the pty has reached EOF -- every
+    /// slave descriptor closed -- so a pid that no longer answers then is the
+    /// child having ended, and how it ended left with the daemon that forked
+    /// it. The pid could in principle have been reused by then; the window is
+    /// between the child's death and this probe, and it is the price of a
+    /// session outliving the process that started it.
+    fn observeChild(self: *Daemon) ?ipc.Exit {
+        if (self.child_is_ours) return child_wait.peek(self.pid, self.exit_reason);
+        lib_posix.kill(self.pid, @enumFromInt(0)) catch |err| switch (err) {
+            error.ProcessNotFound => return .{
+                .reason = self.exit_reason,
+                .status_known = false,
+            },
+            // Anything else -- a pid now owned by another user, say -- is not
+            // proof the child is gone, so nothing is claimed.
+            else => return null,
+        };
+        return null;
+    }
+
     /// Observe the child and tell every attached client how it ended.
     ///
     /// Ordering is the contract: this runs after the final PTY bytes have
@@ -1628,7 +1909,7 @@ pub const Daemon = struct {
         // itself -- closing its stdio and carrying on. waitid(WNOWAIT) tells
         // us only when the child really ended while leaving its zombie in
         // place, so teardown cannot signal a reused pid or process group.
-        const status = child_wait.peek(self.pid, self.exit_reason) orelse {
+        const status = self.observeChild() orelse {
             if (!self.logged_unreaped) {
                 self.logged_unreaped = true;
                 std.log.info(
@@ -1639,10 +1920,17 @@ pub const Daemon = struct {
             return;
         };
         self.child_status = status;
-        std.log.info(
-            "child exited session={s} pid={d} code={d} signal={d} reason={s}",
-            .{ self.session_name, self.pid, status.code, status.signal, @tagName(status.reason) },
-        );
+        if (status.status_known) {
+            std.log.info(
+                "child exited session={s} pid={d} code={d} signal={d} reason={s}",
+                .{ self.session_name, self.pid, status.code, status.signal, @tagName(status.reason) },
+            );
+        } else {
+            std.log.info(
+                "adopted child ended session={s} pid={d} status=unknown reason={s}",
+                .{ self.session_name, self.pid, @tagName(status.reason) },
+            );
+        }
         for (self.clients.items) |client| {
             // Only a client that negotiated knows this frame; a legacy one
             // learns what it always did, from the socket closing.
@@ -1695,6 +1983,17 @@ pub const Daemon = struct {
         // out: anything the child backgrounded is in this group and would
         // otherwise outlive the session.
         const ended = self.child_status != null;
+        // An adopted child that has already been seen to end is not signalled
+        // at all. Nothing pins its pid -- init reaped it, not us -- so the
+        // process group that name refers to may by now be somebody else's,
+        // and a stray background process is the smaller harm.
+        if (ended and !self.child_is_ours) {
+            std.log.info(
+                "adopted child already ended; not signalling session={s} pid={d}",
+                .{ self.session_name, self.pid },
+            );
+            return;
+        }
         std.log.info("sending SIGHUP session={s} pid={d}", .{ self.session_name, self.pid });
         lib_posix.kill(-self.pid, lib_posix.SIG.HUP) catch |err| {
             if (ended) {
@@ -1711,6 +2010,257 @@ pub const Daemon = struct {
                 std.log.warn("failed to send SIGKILL to pty child err={s}", .{@errorName(err)});
             }
         };
+    }
+
+    /// Answers a migrate request and pushes the answer out now rather than
+    /// leaving it in the buffer the loop drains: when the handoff succeeded
+    /// this is the last thing this daemon will ever say, and the loop it
+    /// would have been flushed by is about to end.
+    fn ackMigrate(
+        self: *Daemon,
+        gpa: std.mem.Allocator,
+        client: *Client,
+        status: u8,
+        message: []const u8,
+    ) void {
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(gpa);
+        payload.append(gpa, status) catch return;
+        payload.appendSlice(gpa, message) catch return;
+        // Appended rather than written straight out, so it lands behind
+        // anything already queued for this client instead of cutting into it.
+        client.queueMessage(gpa, .MigrateAck, payload.items) catch return;
+
+        var waited_ms: i32 = 0;
+        while (client.write_buf.items.len > 0 and waited_ms < 1000) {
+            var fds = [_]lib_posix.pollfd{.{
+                .fd = client.socket_fd,
+                .events = lib_posix.POLL.OUT,
+                .revents = 0,
+            }};
+            const ready = lib_posix.poll(&fds, 20) catch break;
+            waited_ms += 20;
+            if (ready == 0) continue;
+            const n = lib_posix.write(client.socket_fd, client.write_buf.items) catch break;
+            if (n == 0) break;
+            client.write_buf.replaceRange(gpa, 0, n, &[_]u8{}) catch unreachable;
+        }
+        if (client.write_buf.items.len == 0) client.has_pending_output = false;
+        if (status != migrate.ack_ok) {
+            std.log.warn("migrate refused session={s} reason={s}", .{ self.session_name, message });
+        }
+    }
+
+    /// Everything the daemon taking this session over needs, as bytes.
+    fn manifestBytes(
+        self: *Daemon,
+        gpa: std.mem.Allocator,
+        term: *ghostty_vt.Terminal,
+    ) ![]u8 {
+        const snapshot = util.serializeTerminalForHandoff(gpa, term) orelse return error.TerminalSnapshotFailed;
+        defer gpa.free(snapshot);
+        const labels = try label.labelsToU8(gpa, self.labels);
+        defer gpa.free(labels);
+        const command: []const u8 = if (self.command) |argv|
+            try migrate.joinCommand(gpa, argv)
+        else
+            "";
+        defer if (command.len > 0) gpa.free(command);
+
+        var flags: u32 = 0;
+        if (self.has_pty_output) flags |= migrate.flag_has_pty_output;
+        if (self.has_had_client) flags |= migrate.flag_has_had_client;
+        if (self.hasAttachedTerminalClient()) flags |= migrate.flag_has_terminal_client;
+        if (self.exit_on_last_client) flags |= migrate.flag_exit_on_last_client;
+        if (self.exit_on_last_client_armed) flags |= migrate.flag_exit_on_last_client_armed;
+        if (self.record_exit) flags |= migrate.flag_record_exit;
+        if (self.is_task_mode) flags |= migrate.flag_is_task_mode;
+        if (self.command != null) flags |= migrate.flag_has_command;
+        if (self.task_exit_code != null) flags |= migrate.flag_has_task_exit_code;
+        if (self.task_ended_at != null) flags |= migrate.flag_has_task_ended_at;
+        if (!self.child_is_ours) flags |= migrate.flag_child_adopted;
+        if (term.screens.get(.primary)) |screen| {
+            if (screen.cursor.pending_wrap) flags |= migrate.flag_primary_pending_wrap;
+            if (screen.saved_cursor) |saved| {
+                if (saved.pending_wrap) flags |= migrate.flag_primary_saved_wrap;
+            }
+        }
+        if (term.screens.get(.alternate)) |screen| {
+            if (screen.cursor.pending_wrap) flags |= migrate.flag_alternate_pending_wrap;
+            if (screen.saved_cursor) |saved| {
+                if (saved.pending_wrap) flags |= migrate.flag_alternate_saved_wrap;
+            }
+        }
+
+        return migrate.encodeManifest(gpa, .{
+            .protocol_version = ipc.protocol_version,
+            .flags = flags,
+            .pid = self.pid,
+            .created_at = self.created_at,
+            .terminal_activity_sequence = self.terminal_activity_sequence,
+            .max_scrollback_lines = self.cfg.max_scrollback_lines,
+            .task_ended_at = self.task_ended_at orelse 0,
+            .task_exit_code = self.task_exit_code orelse 0,
+            .task_id = self.task_id,
+            .session_name = self.session_name,
+            .socket_path = self.socket_path,
+            .cwd = self.cwd,
+            .command = command,
+            .shell = self.shell,
+            .labels = labels,
+            // Bytes this daemon accepted for the child that the pty had not
+            // taken yet. Nobody else has them: they would simply be lost.
+            .pty_input = self.pty_write_buf.items,
+            .snapshot = snapshot,
+        });
+    }
+
+    /// The exchange itself. Everything before the commit can fail and leave
+    /// this daemon holding exactly what it held before; nothing after the
+    /// commit is allowed to fail, which is why the last acknowledgement is
+    /// only logged.
+    fn performHandoff(
+        self: *Daemon,
+        gpa: std.mem.Allocator,
+        term: *ghostty_vt.Terminal,
+        listener: lib_posix.socket_t,
+        server_sock_fd: lib_posix.socket_t,
+        pty_fd: i32,
+        token: *const [migrate.token_len]u8,
+    ) !void {
+        try migrate.waitReadable(listener, migrate.step_timeout_ms);
+        const conn = try lib_posix.accept(listener, null, null, lib_posix.SOCK.CLOEXEC);
+        defer lib_posix.close(conn);
+        try migrate.setNonBlocking(conn);
+
+        var offered: [migrate.token_len]u8 = undefined;
+        try migrate.readExact(conn, &offered, migrate.step_timeout_ms);
+        if (!std.mem.eql(u8, &offered, token)) return error.WrongHandoffToken;
+
+        const bytes = try self.manifestBytes(gpa, term);
+        defer gpa.free(bytes);
+        // Refused here rather than by the receiver, which can only say the
+        // frame was wrong: a session whose scrollback will not fit needs to
+        // hear that that is what happened.
+        if (bytes.len > migrate.max_manifest_len) {
+            std.log.warn(
+                "session too large to hand over session={s} manifest={d}B cap={d}B",
+                .{ self.session_name, bytes.len, migrate.max_manifest_len },
+            );
+            return error.SessionTooLargeToMigrate;
+        }
+        try migrate.sendManifest(conn, bytes);
+        try migrate.awaitWord(conn, migrate.word_validated, migrate.step_timeout_ms);
+
+        // The pty first: the receiver reads the two in this order, and there
+        // is nothing in a descriptor to say which it is.
+        try migrate.sendFdsWithin(conn, &.{ pty_fd, server_sock_fd }, migrate.step_timeout_ms);
+        try migrate.awaitWord(conn, migrate.word_restored, migrate.step_timeout_ms);
+
+        // The point of no return. Up to here the receiver has only copies it
+        // has not acted on; after this it is the session.
+        try migrate.sendWord(conn, migrate.word_committed);
+        migrate.awaitWord(conn, migrate.word_owned, migrate.owned_timeout_ms) catch |err| {
+            std.log.warn(
+                "no ownership ack after commit session={s} err={s}",
+                .{ self.session_name, @errorName(err) },
+            );
+        };
+    }
+
+    /// Hands this session to another build of zmx, keeping the child and its
+    /// terminal alive across the swap. See `migrate.zig` for what crosses.
+    ///
+    /// Running inline is what makes it safe: the daemon is single-threaded,
+    /// so for the length of the exchange nothing reads the pty, writes to the
+    /// child, or serves a client, and the snapshot cannot go stale under it.
+    /// Bytes the child writes meanwhile wait in the kernel's pty buffer and
+    /// are read by whoever holds the master next.
+    ///
+    /// Returns true when the session belongs to another process and this one
+    /// must leave without touching it.
+    pub fn handleMigrate(
+        self: *Daemon,
+        gpa: std.mem.Allocator,
+        client: *Client,
+        term: *ghostty_vt.Terminal,
+        server_sock_fd: lib_posix.socket_t,
+        pty_fd: i32,
+        payload: []const u8,
+        ending: bool,
+    ) bool {
+        // A session whose child is gone has nothing to hand over, and its
+        // exit is already on its way to the clients watching for it.
+        if (ending or self.child_status != null) {
+            self.ackMigrate(gpa, client, migrate.ack_refused, "the session is ending");
+            return false;
+        }
+        if (payload.len == 0 or payload[0] != '/' or payload.len >= std.fs.max_path_bytes) {
+            self.ackMigrate(gpa, client, migrate.ack_refused, "migrate needs an absolute path to a zmx binary");
+            return false;
+        }
+        var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+        @memcpy(exe_buf[0..payload.len], payload);
+        exe_buf[payload.len] = 0;
+        const exe_z: [*:0]const u8 = @ptrCast(&exe_buf);
+        // Checked before anything is torn down or spawned, so the ordinary
+        // mistake -- a path that is not there any more -- costs the session
+        // nothing at all.
+        if (cross.c.access(exe_z, cross.c.X_OK) != 0) {
+            self.ackMigrate(gpa, client, migrate.ack_refused, "target is not an executable file");
+            return false;
+        }
+
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const handoff_path = migrate.socketPath(&path_buf, self.cfg.log_dir, cross.c.getpid()) catch {
+            self.ackMigrate(gpa, client, migrate.ack_refused, "no room for a handoff socket path");
+            return false;
+        };
+        const token = migrate.newToken() catch |err| {
+            self.ackMigrate(gpa, client, migrate.ack_refused, @errorName(err));
+            return false;
+        };
+        const listener = migrate.bindHandoffSocket(handoff_path) catch |err| {
+            self.ackMigrate(gpa, client, migrate.ack_refused, @errorName(err));
+            return false;
+        };
+        // Wanted only for the one connection, and unwanted the moment it
+        // arrives -- on the way out as well as on the way back.
+        defer {
+            lib_posix.close(listener);
+            _ = cross.c.unlink(handoff_path.ptr);
+        }
+
+        std.log.info(
+            "migrating session={s} to exe={s} socket={s}",
+            .{ self.session_name, payload, handoff_path },
+        );
+        const importer = migrate.spawnImporter(payload, handoff_path, &token) catch |err| {
+            self.ackMigrate(gpa, client, migrate.ack_refused, @errorName(err));
+            return false;
+        };
+
+        self.performHandoff(gpa, term, listener, server_sock_fd, pty_fd, &token) catch |err| {
+            std.log.warn(
+                "handoff failed session={s} err={s}; keeping the session",
+                .{ self.session_name, @errorName(err) },
+            );
+            // An importer that did not finish the exchange never acted on
+            // anything it was sent, so ending it here costs nothing and
+            // leaves no process behind. It is ours to reap.
+            lib_posix.kill(importer, lib_posix.SIG.KILL) catch {};
+            _ = lib_posix.waitpid(importer, 0);
+            self.ackMigrate(gpa, client, migrate.ack_refused, @errorName(err));
+            return false;
+        };
+
+        std.log.info(
+            "handed off session={s} pid={d} to daemon={d}",
+            .{ self.session_name, self.pid, importer },
+        );
+        self.handed_off = true;
+        self.ackMigrate(gpa, client, migrate.ack_ok, payload);
+        return true;
     }
 
     pub fn handleInfo(self: *Daemon, gpa: std.mem.Allocator, client: *Client, term: *ghostty_vt.Terminal) !void {
@@ -2466,4 +3016,55 @@ test "a failed Restore does not complete attach or arm last-client exit" {
         try std.testing.expectEqual(@as(?i32, null), daemon.leader_client_fd);
         if (failure == 1) try std.testing.expectEqual(@as(usize, ipc.header_len), client.write_buf.items.len);
     }
+}
+
+test "a handoff manifest refuses every allocation failure without dropping state" {
+    const alloc = std.testing.allocator;
+    var cfg: Cfg = .{ .socket_dir = "", .log_dir = "" };
+    var daemon = testDaemon();
+    daemon.cfg = &cfg;
+    try daemon.applyLabels(alloc, "owner=smolmux instance=one");
+    defer {
+        var it = daemon.labels.iterator();
+        while (it.next()) |entry| {
+            alloc.free(entry.key_ptr.*);
+            alloc.free(entry.value_ptr.*);
+        }
+        daemon.labels.deinit(alloc);
+    }
+    var term = try ghostty_vt.Terminal.init(std.testing.io, alloc, .{ .cols = 80, .rows = 24 });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("kept terminal\x1b[?2026h");
+    // Walk every allocation in one manifest attempt. A failed snapshot or
+    // labels encoder must never become a successful but incomplete manifest.
+    for (0..128) |failure| {
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = failure });
+        if (daemon.manifestBytes(failing.allocator(), &term)) |bytes| {
+            defer failing.allocator().free(bytes);
+            try std.testing.expect(!failing.has_induced_failure);
+            const manifest = try migrate.decodeManifest(bytes);
+            try std.testing.expect(std.mem.indexOf(u8, manifest.snapshot, "kept terminal") != null);
+            try std.testing.expectEqualStrings("instance=one owner=smolmux", manifest.labels);
+            return;
+        } else |err| {
+            try std.testing.expect(err == error.OutOfMemory or err == error.TerminalSnapshotFailed);
+            try std.testing.expect(failing.has_induced_failure);
+        }
+        try std.testing.expect(term.modes.get(.synchronized_output));
+        try std.testing.expectEqualStrings("smolmux", daemon.labels.get("owner").?);
+    }
+    return error.ManifestNeverCompleted;
+}
+
+test "migration refusal respects the client output budget" {
+    const alloc = std.testing.allocator;
+    var daemon = testDaemon();
+    var client = try testClient(alloc);
+    defer deinitTestClient(&client);
+    try client.write_buf.resize(alloc, Client.output_max);
+    daemon.ackMigrate(alloc, &client, migrate.ack_refused, "ending");
+    try std.testing.expect(client.disconnect);
+    try std.testing.expectEqual(@as(usize, 0), client.write_buf.items.len);
 }

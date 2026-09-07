@@ -853,6 +853,182 @@ fn writeColorOverrides(writer: *std.Io.Writer, term: *const ghostty_vt.Terminal)
     try writeDynamicColor(writer, .cursor, colors.cursor);
 }
 
+/// How many rows at the bottom of the active area hold nothing.
+///
+/// A formatter says nothing about a trailing blank row, which is the row a
+/// session's cursor sits on between two lines of output. Replaying content
+/// alone therefore leaves the last written line at the very bottom of the
+/// screen, one scroll behind a source that had already moved past it -- and
+/// an absolute cursor position then lands on that line instead of below it,
+/// so the next thing the child writes overwrites it.
+fn trailingBlankRows(screen: *const ghostty_vt.Screen) u16 {
+    const pages = &screen.pages;
+    var blank: u16 = 0;
+    var y: usize = pages.rows;
+    while (y > 0) {
+        y -= 1;
+        const pin = pages.pin(.{ .active = .{ .x = 0, .y = @intCast(y) } }) orelse break;
+        for (pin.cells(.all)) |cell| {
+            if (!cell.isEmpty()) return blank;
+        }
+        blank += 1;
+    }
+    return blank;
+}
+
+/// The shadow terminal as bytes another daemon can replay into an empty
+/// terminal of the same size and end up holding exactly what this one holds.
+///
+/// Not the same job as `serializeTerminalState`, which dresses a screen for a
+/// client that is attaching. That one emits the scrollback, then clears the
+/// visible area before drawing the active screen onto it -- and the clear
+/// takes with it the last screenful of scrollback, which by then has scrolled
+/// into view. For a person's terminal that is invisible and worth it, because
+/// the visible screen is then exact whatever preceded it. For a handoff it is
+/// not: the shadow terminal is the session's own memory of itself, and a
+/// migration that ate a screen every time would erode it a screen at a time.
+///
+/// A screen's scrollback and visible area go out as one continuous stream, in
+/// the order the child produced them, which is why a terminal reassembles
+/// them correctly. Screen-switch modes precede alternate content; other
+/// state follows painting so margins, origin and cursor style remain exact.
+///
+/// Null when any part of it could not be produced. A snapshot missing a
+/// screen would still look like a snapshot, and the handoff would commit it.
+pub fn serializeTerminalForHandoff(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal) ?[]const u8 {
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    // Transient between a program and whichever client is rendering it; a
+    // daemon replaying this would otherwise start out deferring renders.
+    const had_synchronized_output = term.modes.get(.synchronized_output);
+    if (had_synchronized_output) term.modes.set(.synchronized_output, false);
+    defer if (had_synchronized_output) term.modes.set(.synchronized_output, true);
+
+    writeColorOverrides(&builder.writer, term) catch return null;
+
+    const primary = term.screens.get(.primary) orelse return null;
+    const on_alternate = term.screens.active_key != .primary;
+
+    // The primary screen first, whichever screen the child is using. When it
+    // is in the alternate screen this is the history it comes back to -- a
+    // restore does not carry it, because a client only ever needs what is on
+    // screen, but a handoff that dropped it would lose the session's whole
+    // scrollback the first time a full-screen program was running.
+    handoffScreens(&builder.writer, term, primary, on_alternate) catch |err| {
+        // Given up whole rather than sent short: a snapshot missing a screen
+        // is still a plausible-looking snapshot, and the daemon receiving it
+        // has no way to know what is not there.
+        std.log.warn("failed to serialize for handoff err={s}", .{@errorName(err)});
+        return null;
+    };
+
+    writePwd(&builder.writer, term) catch return null;
+    if (term.getTitle()) |title| {
+        builder.writer.print("\x1b]2;{s}\x07", .{title}) catch |err| {
+            std.log.warn("failed to format title err={s}", .{@errorName(err)});
+            return null;
+        };
+    }
+
+    const output = builder.writer.buffered();
+    if (output.len == 0) return null;
+    return alloc.dupe(u8, output) catch |err| {
+        std.log.warn("failed to allocate terminal state err={s}", .{@errorName(err)});
+        return null;
+    };
+}
+
+/// Paint each screen with neutral geometry, then restore its active state.
+fn handoffScreens(
+    writer: *std.Io.Writer,
+    term: *ghostty_vt.Terminal,
+    primary: *const ghostty_vt.Screen,
+    on_alternate: bool,
+) !void {
+    try writeScreenStream(writer, primary);
+    if (on_alternate) {
+        // Restore the primary cursor/style before 1049 saves it. Only screen
+        // switches are emitted here: origin, margins, insert mode and SGR
+        // must not affect the bytes used to paint the alternate screen.
+        var primary_state = ghostty_vt.formatter.ScreenFormatter.init(primary, .vt);
+        primary_state.content = .none;
+        primary_state.extra = .all;
+        try primary_state.format(writer);
+        inline for (.{ .alt_screen_legacy, .alt_screen, .alt_screen_save_cursor_clear_enter }) |mode| {
+            if (term.modes.get(mode)) {
+                const number: u16 = switch (mode) {
+                    .alt_screen_legacy => 47,
+                    .alt_screen => 1047,
+                    .alt_screen_save_cursor_clear_enter => 1049,
+                    else => unreachable,
+                };
+                try writer.print("\x1b[?{d}h", .{number});
+            }
+        }
+        try writer.writeAll("\x1b[0m\x1b[H");
+        try writeScreenStream(writer, term.screens.active);
+    }
+
+    // Shallow formatter-only view: suppress screen-switch modes already
+    // emitted above. Repeating 1049 would save the wrong cursor and clear
+    // the alternate screen. All other state is restored after painting.
+    var state_term = term.*;
+    state_term.modes.set(.alt_screen_legacy, false);
+    state_term.modes.set(.alt_screen, false);
+    state_term.modes.set(.alt_screen_save_cursor_clear_enter, false);
+    var state_fmt = ghostty_vt.formatter.TerminalFormatter.init(&state_term, .vt);
+    state_fmt.content = .none;
+    state_fmt.extra = .{
+        .palette = true,
+        .modes = true,
+        .scrolling_region = true,
+        .tabstops = true,
+        .pwd = false,
+        .keyboard = true,
+        .screen = .all,
+    };
+    try state_fmt.format(writer);
+
+    // DECSTBM and tabstop restoration move the cursor, even on the primary
+    // screen. CUP is relative to both margins when origin mode is active.
+    const cursor = term.screens.active.cursor;
+    const origin = term.modes.get(.origin);
+    try writer.print("\x1b[{d};{d}H", .{
+        @as(u32, cursor.y -| (if (origin) term.scrolling_region.top else 0)) + 1,
+        @as(u32, cursor.x -| (if (origin) term.scrolling_region.left else 0)) + 1,
+    });
+}
+
+/// One screen's scrollback and visible area as a continuous stream, the order
+/// the child produced them in, which is what lets a terminal reassemble them.
+fn writeScreenStream(writer: *std.Io.Writer, screen: *const ghostty_vt.Screen) !void {
+    const pages = &screen.pages;
+    var fmt = ghostty_vt.formatter.ScreenFormatter.init(screen, .vt);
+    if (pages.pin(.{ .active = .{
+        .x = @intCast(pages.cols - 1),
+        .y = @intCast(pages.rows - 1),
+    } })) |active_br| {
+        fmt.content = .{
+            .selection = ghostty_vt.Selection.init(pages.getTopLeft(.screen), active_br, false),
+        };
+    }
+    fmt.extra = .none;
+    fmt.format(writer) catch |err| {
+        std.log.warn("failed to format screen content err={s}", .{@errorName(err)});
+        return error.ScreenFormatFailed;
+    };
+
+    // Scroll the replay the rest of the way. Only a screen that has already
+    // scrolled needs this: without scrollback the content still begins at the
+    // top row on both sides, and these newlines would push a blank line into
+    // a scrollback the source does not have.
+    if (!pages.getTopLeft(.screen).eql(pages.getTopLeft(.active))) {
+        var blank = trailingBlankRows(screen);
+        while (blank > 0) : (blank -= 1) try writer.writeAll("\r\n");
+    }
+}
+
 pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal) ?[]const u8 {
     var builder: std.Io.Writer.Allocating = .init(alloc);
     defer builder.deinit();
@@ -2393,4 +2569,246 @@ test "failed Restore serialization preserves synchronized-output mode" {
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
     try std.testing.expectEqual(@as(?[]const u8, null), serializeTerminalState(failing.allocator(), &term));
     try std.testing.expect(term.modes.get(.synchronized_output));
+}
+
+test "serializeTerminalForHandoff round-trips a scrolled terminal whole" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var source = try ghostty_vt.Terminal.init(io, alloc, .{
+        .cols = 80,
+        .rows = 24,
+        .max_scrollback_bytes = null,
+        .max_scrollback_lines = 5000,
+    });
+    defer source.deinit(alloc);
+    var source_stream = source.vtStream();
+    defer source_stream.deinit();
+
+    // Enough to scroll many screens, so scrollback and the active area are
+    // both populated -- the case where the client restore's clear used to eat
+    // the screenful between them.
+    var line_buf: [32]u8 = undefined;
+    for (1..201) |i| {
+        source_stream.nextSlice(try std.fmt.bufPrint(&line_buf, "L{d}\r\n", .{i}));
+    }
+
+    const snapshot = serializeTerminalForHandoff(alloc, &source) orelse
+        return error.NoSnapshot;
+    defer alloc.free(snapshot);
+
+    var target = try ghostty_vt.Terminal.init(io, alloc, .{
+        .cols = 80,
+        .rows = 24,
+        .max_scrollback_bytes = null,
+        .max_scrollback_lines = 5000,
+    });
+    defer target.deinit(alloc);
+    var target_stream = target.vtStream();
+    defer target_stream.deinit();
+    target_stream.nextSlice(snapshot);
+
+    const before = serializeTerminal(alloc, &source, .plain) orelse return error.NoText;
+    defer alloc.free(before);
+    const after = serializeTerminal(alloc, &target, .plain) orelse return error.NoText;
+    defer alloc.free(after);
+    try testing.expectEqualStrings(before, after);
+}
+
+test "handoff restores cursor after margins and customized tabstops" {
+    const alloc = testing.allocator;
+    for ([_][]const u8{
+        "\x1b[2;5r\x1b[4;3H",
+        "\x1b[2;5r\x1b[?6h\x1b[3;3H",
+        "\x1b[3g\x1b[1;4H\x1bH\x1b[4;3H",
+        "primary\x1b[?1049hTOP\r\nsecond\r\nthird\x1b[2;5r\x1b[?6h\x1b[3;3H\x1b[32m",
+        "primary\x1b[?1049h\x1b[31mRED\x1b[32m",
+    }) |state| {
+        var source = try ghostty_vt.Terminal.init(testing.io, alloc, .{ .cols = 12, .rows = 6 });
+        defer source.deinit(alloc);
+        var ss = source.vtStream();
+        defer ss.deinit();
+        ss.nextSlice(state);
+        const snapshot = serializeTerminalForHandoff(alloc, &source) orelse return error.NoSnapshot;
+        defer alloc.free(snapshot);
+        var target = try ghostty_vt.Terminal.init(testing.io, alloc, .{ .cols = 12, .rows = 6 });
+        defer target.deinit(alloc);
+        var ts = target.vtStream();
+        defer ts.deinit();
+        ts.nextSlice(snapshot);
+        try testing.expectEqual(source.screens.active.cursor.x, target.screens.active.cursor.x);
+        try testing.expectEqual(source.screens.active.cursor.y, target.screens.active.cursor.y);
+        try testing.expectEqualDeep(source.screens.active.cursor.style, target.screens.active.cursor.style);
+        ss.nextSlice("X\tY");
+        ts.nextSlice("X\tY");
+        const before = serializeTerminal(alloc, &source, .plain) orelse return error.NoText;
+        defer alloc.free(before);
+        const after = serializeTerminal(alloc, &target, .plain) orelse return error.NoText;
+        defer alloc.free(after);
+        try testing.expectEqualStrings(before, after);
+        if (source.screens.active_key == .alternate) {
+            ss.nextSlice("\x1b[?1049l");
+            ts.nextSlice("\x1b[?1049l");
+            try testing.expectEqual(source.screens.active.cursor.x, target.screens.active.cursor.x);
+            try testing.expectEqual(source.screens.active.cursor.y, target.screens.active.cursor.y);
+        }
+    }
+}
+
+test "serializeTerminalForHandoff keeps a line the child had not finished" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var source = try ghostty_vt.Terminal.init(io, alloc, .{
+        .cols = 80,
+        .rows = 24,
+        .max_scrollback_bytes = null,
+        .max_scrollback_lines = 5000,
+    });
+    defer source.deinit(alloc);
+    var source_stream = source.vtStream();
+    defer source_stream.deinit();
+
+    var line_buf: [32]u8 = undefined;
+    for (1..100) |i| {
+        source_stream.nextSlice(try std.fmt.bufPrint(&line_buf, "L{d}\r\n", .{i}));
+    }
+    // A handoff lands wherever the child happened to be: the bytes that
+    // finish this line are still in the pty when the snapshot is taken, and
+    // the daemon that takes over reads them.
+    source_stream.nextSlice("L100");
+
+    const snapshot = serializeTerminalForHandoff(alloc, &source) orelse
+        return error.NoSnapshot;
+    defer alloc.free(snapshot);
+
+    var target = try ghostty_vt.Terminal.init(io, alloc, .{
+        .cols = 80,
+        .rows = 24,
+        .max_scrollback_bytes = null,
+        .max_scrollback_lines = 5000,
+    });
+    defer target.deinit(alloc);
+    var target_stream = target.vtStream();
+    defer target_stream.deinit();
+    target_stream.nextSlice(snapshot);
+
+    // Both sides then see the rest of that line and the next one.
+    source_stream.nextSlice("\r\nL101\r\n");
+    target_stream.nextSlice("\r\nL101\r\n");
+
+    const before = serializeTerminal(alloc, &source, .plain) orelse return error.NoText;
+    defer alloc.free(before);
+    const after = serializeTerminal(alloc, &target, .plain) orelse return error.NoText;
+    defer alloc.free(after);
+    try testing.expectEqualStrings(before, after);
+}
+
+test "serializeTerminalForHandoff keeps the screen where the source had it" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var source = try ghostty_vt.Terminal.init(io, alloc, .{
+        .cols = 80,
+        .rows = 24,
+        .max_scrollback_bytes = null,
+        .max_scrollback_lines = 5000,
+    });
+    defer source.deinit(alloc);
+    var source_stream = source.vtStream();
+    defer source_stream.deinit();
+
+    // Every line finished, so the cursor sits on a blank row below the last
+    // one -- the ordinary state of a session between two lines of output, and
+    // the row a formatter has nothing to say about.
+    var line_buf: [32]u8 = undefined;
+    for (1..201) |i| {
+        source_stream.nextSlice(try std.fmt.bufPrint(&line_buf, "L{d}\r\n", .{i}));
+    }
+
+    const snapshot = serializeTerminalForHandoff(alloc, &source) orelse
+        return error.NoSnapshot;
+    defer alloc.free(snapshot);
+
+    var target = try ghostty_vt.Terminal.init(io, alloc, .{
+        .cols = 80,
+        .rows = 24,
+        .max_scrollback_bytes = null,
+        .max_scrollback_lines = 5000,
+    });
+    defer target.deinit(alloc);
+    var target_stream = target.vtStream();
+    defer target_stream.deinit();
+    target_stream.nextSlice(snapshot);
+
+    // What the child writes next must land below L200 on both sides. If the
+    // replay is one scroll behind, the new line overwrites L200 instead.
+    source_stream.nextSlice("L201\r\n");
+    target_stream.nextSlice("L201\r\n");
+
+    const before = serializeTerminal(alloc, &source, .plain) orelse return error.NoText;
+    defer alloc.free(before);
+    const after = serializeTerminal(alloc, &target, .plain) orelse return error.NoText;
+    defer alloc.free(after);
+    try testing.expectEqualStrings(before, after);
+}
+
+test "serializeTerminalForHandoff carries a full-screen program's screen" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var source = try ghostty_vt.Terminal.init(io, alloc, .{
+        .cols = 40,
+        .rows = 6,
+        .max_scrollback_bytes = null,
+        .max_scrollback_lines = 500,
+    });
+    defer source.deinit(alloc);
+    var source_stream = source.vtStream();
+    defer source_stream.deinit();
+
+    // A shell, then a program that takes the alternate screen -- the shape of
+    // every agent the Companion holds.
+    var line_buf: [32]u8 = undefined;
+    for (1..41) |i| {
+        source_stream.nextSlice(try std.fmt.bufPrint(&line_buf, "shell {d}\r\n", .{i}));
+    }
+    source_stream.nextSlice("\x1b[?1049h");
+    source_stream.nextSlice("\x1b[H\x1b[2JALT-ONE\r\nALT-TWO");
+
+    const snapshot = serializeTerminalForHandoff(alloc, &source) orelse
+        return error.NoSnapshot;
+    defer alloc.free(snapshot);
+
+    var target = try ghostty_vt.Terminal.init(io, alloc, .{
+        .cols = 40,
+        .rows = 6,
+        .max_scrollback_bytes = null,
+        .max_scrollback_lines = 500,
+    });
+    defer target.deinit(alloc);
+    var target_stream = target.vtStream();
+    defer target_stream.deinit();
+    target_stream.nextSlice(snapshot);
+
+    try testing.expectEqual(source.screens.active_key, target.screens.active_key);
+    {
+        const before = serializeTerminal(alloc, &source, .plain) orelse return error.NoText;
+        defer alloc.free(before);
+        const after = serializeTerminal(alloc, &target, .plain) orelse return error.NoText;
+        defer alloc.free(after);
+        try testing.expectEqualStrings(before, after);
+    }
+
+    // And the scrollback underneath it: what the session comes back to when
+    // the program exits. No restore carries this, because a client only ever
+    // needs what is on screen, but the shadow terminal is the session itself.
+    source_stream.nextSlice("\x1b[?1049l");
+    target_stream.nextSlice("\x1b[?1049l");
+    const before = serializeTerminal(alloc, &source, .plain) orelse return error.NoText;
+    defer alloc.free(before);
+    const after = serializeTerminal(alloc, &target, .plain) orelse return error.NoText;
+    defer alloc.free(after);
+    try testing.expectEqualStrings(before, after);
+    try testing.expect(std.mem.indexOf(u8, after, "shell 40") != null);
 }

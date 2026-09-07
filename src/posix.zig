@@ -51,6 +51,9 @@ pub const STDOUT_FILENO = system.STDOUT_FILENO;
 pub const Sigaction = system.Sigaction;
 pub const SIG = system.SIG;
 pub const siginfo_t = system.siginfo_t;
+pub const SOL = system.SOL;
+pub const SCM = system.SCM;
+pub const MSG = system.MSG;
 
 // https://github.com/ziglang/zig/blob/738d2be9d6b6ef3ff3559130c05159ef53336224/lib/std/posix.zig#L3505
 pub const O_NONBLOCK: usize = 1 << @bitOffsetOf(O, "NONBLOCK");
@@ -476,7 +479,7 @@ pub fn fcntl(fd: fd_t, cmd: i32, arg: usize) FcntlError!usize {
     }
 }
 
-const WriteError = error{
+pub const WriteError = error{
     DiskQuota,
     FileTooBig,
     InputOutput,
@@ -1320,4 +1323,190 @@ pub fn kill(pid: pid_t, sig: SIG) KillError!void {
         .SRCH => return error.ProcessNotFound,
         else => |err| return unexpectedErrno(err),
     }
+}
+
+/// The most file descriptors one `sendFds` call may carry. Two is what a
+/// session handoff needs (the pty master and the listening socket); the
+/// headroom is so a later frame can add one without resizing the protocol.
+pub const max_passed_fds = 8;
+
+/// `CMSG_ALIGN`, without the macro. The kernel's control-message layout
+/// rounds to the alignment of `cmsghdr` itself -- four bytes on Darwin,
+/// where the length is a `socklen_t`, and eight on Linux, where it is a
+/// `usize` -- which is exactly what `@alignOf` reports for each.
+fn cmsgAlign(len: usize) usize {
+    const alignment = @alignOf(system.cmsghdr);
+    return (len + alignment - 1) & ~@as(usize, alignment - 1);
+}
+
+fn cmsgLen(len: usize) usize {
+    return cmsgAlign(@sizeOf(system.cmsghdr)) + len;
+}
+
+fn cmsgSpace(len: usize) usize {
+    return cmsgAlign(@sizeOf(system.cmsghdr)) + cmsgAlign(len);
+}
+
+const cmsg_buf_len = cmsgSpace(@sizeOf(fd_t) * max_passed_fds);
+
+pub const SendFdsError = error{
+    /// More descriptors than `max_passed_fds`, or none at all: a control
+    /// message must carry something.
+    InvalidArgument,
+    BrokenPipe,
+    ConnectionResetByPeer,
+    WouldBlock,
+    SystemResources,
+} || UnexpectedError;
+
+/// Hands open file descriptors to the peer of a Unix-domain socket.
+///
+/// The kernel duplicates each one into the receiving process, so what
+/// arrives is the same open file description -- the same pty master, the
+/// same listening socket, with the same offset and status flags -- not a
+/// reopened copy. This is the only way a process can give another process
+/// something it cannot open by name, which is what makes a session handoff
+/// possible at all: nothing about the pty or its child changes hands, only
+/// who is holding the descriptor.
+///
+/// One data byte rides along because a control message needs a payload to
+/// be delivered with.
+pub fn sendFds(sock: socket_t, fds: []const fd_t) SendFdsError!void {
+    if (fds.len == 0 or fds.len > max_passed_fds) return error.InvalidArgument;
+
+    var payload = [_]u8{'F'};
+    var iov = [_]system.iovec_const{.{ .base = &payload, .len = payload.len }};
+
+    const fd_bytes = @sizeOf(fd_t) * fds.len;
+    var control: [cmsg_buf_len]u8 align(@alignOf(system.cmsghdr)) = undefined;
+    const control_len = cmsgSpace(fd_bytes);
+    @memset(control[0..control_len], 0);
+
+    const header: *system.cmsghdr = @ptrCast(@alignCast(&control));
+    header.* = .{
+        .len = @intCast(cmsgLen(fd_bytes)),
+        .level = SOL.SOCKET,
+        .type = SCM.RIGHTS,
+    };
+    @memcpy(
+        control[cmsgAlign(@sizeOf(system.cmsghdr))..][0..fd_bytes],
+        std.mem.sliceAsBytes(fds),
+    );
+
+    var msg = std.mem.zeroes(system.msghdr_const);
+    msg.iov = &iov;
+    msg.iovlen = 1;
+    msg.control = &control;
+    msg.controllen = @intCast(control_len);
+
+    while (true) {
+        const rc = system.sendmsg(sock, &msg, 0);
+        switch (errno(rc)) {
+            .SUCCESS => return,
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .PIPE => return error.BrokenPipe,
+            .CONNRESET => return error.ConnectionResetByPeer,
+            .NOBUFS, .NOMEM => return error.SystemResources,
+            .INVAL => return error.InvalidArgument,
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+pub const RecvFdsError = error{
+    /// The peer closed without sending anything.
+    EndOfStream,
+    /// A message arrived carrying no descriptors, or carrying a control
+    /// message that was not `SCM_RIGHTS`, or one the kernel had to
+    /// truncate. Every one of these means the handoff cannot be trusted.
+    NoDescriptors,
+    ConnectionResetByPeer,
+    WouldBlock,
+    SystemResources,
+} || UnexpectedError;
+
+/// Receives descriptors sent by `sendFds`, writing them into `out` and
+/// returning how many arrived. The data byte is read and discarded.
+///
+/// A truncated control message is refused rather than accepted short: the
+/// kernel closes what it could not deliver, and a half-delivered handoff
+/// would leave the session owned by neither side.
+pub fn recvFds(sock: socket_t, out: []fd_t) RecvFdsError!usize {
+    if (out.len == 0 or out.len > max_passed_fds) return error.NoDescriptors;
+
+    var payload: [1]u8 = undefined;
+    var iov = [_]system.iovec{.{ .base = &payload, .len = payload.len }};
+
+    var control: [cmsg_buf_len]u8 align(@alignOf(system.cmsghdr)) = undefined;
+    @memset(&control, 0);
+
+    var msg = std.mem.zeroes(system.msghdr);
+    msg.iov = &iov;
+    msg.iovlen = 1;
+    msg.control = &control;
+    msg.controllen = @intCast(cmsgSpace(@sizeOf(fd_t) * out.len));
+
+    const received = while (true) {
+        const rc = system.recvmsg(sock, &msg, 0);
+        switch (errno(rc)) {
+            .SUCCESS => break @as(usize, @intCast(rc)),
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .CONNRESET => return error.ConnectionResetByPeer,
+            .NOMEM => return error.SystemResources,
+            else => |err| return unexpectedErrno(err),
+        }
+    };
+    if (received == 0) return error.EndOfStream;
+    if (msg.flags & @as(u32, MSG.CTRUNC) != 0) return error.NoDescriptors;
+    if (msg.controllen < cmsgLen(@sizeOf(fd_t))) return error.NoDescriptors;
+
+    const header: *const system.cmsghdr = @ptrCast(@alignCast(&control));
+    if (header.level != SOL.SOCKET or header.type != SCM.RIGHTS) return error.NoDescriptors;
+
+    const header_len = cmsgAlign(@sizeOf(system.cmsghdr));
+    const data_len = @as(usize, @intCast(header.len)) -| header_len;
+    const count = data_len / @sizeOf(fd_t);
+    if (count == 0 or count > out.len) return error.NoDescriptors;
+    @memcpy(
+        std.mem.sliceAsBytes(out[0..count]),
+        control[header_len..][0 .. count * @sizeOf(fd_t)],
+    );
+    return count;
+}
+
+test "sendFds hands a descriptor to the other end of a socketpair" {
+    if (native_os == .windows) return error.SkipZigTest;
+    var pair: [2]fd_t = undefined;
+    if (errno(system.socketpair(AF.UNIX, SOCK.STREAM, 0, &pair)) != .SUCCESS) return error.SkipZigTest;
+    defer close(pair[0]);
+    defer close(pair[1]);
+
+    const pipe_fds = try pipe2(.{ .CLOEXEC = true });
+    defer close(pipe_fds[0]);
+
+    try sendFds(pair[0], &.{pipe_fds[1]});
+    var got: [2]fd_t = undefined;
+    const n = try recvFds(pair[1], &got);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    // A distinct descriptor number naming the same open file: writing to
+    // the copy is readable from the original pipe's read end.
+    try std.testing.expect(got[0] != pipe_fds[1]);
+    close(pipe_fds[1]);
+    _ = try write(got[0], "hi");
+    close(got[0]);
+    var buf: [8]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 2), try read(pipe_fds[0], &buf));
+    try std.testing.expectEqualStrings("hi", buf[0..2]);
+}
+
+test "sendFds refuses a count it cannot carry" {
+    var pair: [2]fd_t = undefined;
+    if (errno(system.socketpair(AF.UNIX, SOCK.STREAM, 0, &pair)) != .SUCCESS) return error.SkipZigTest;
+    defer close(pair[0]);
+    defer close(pair[1]);
+    try std.testing.expectError(error.InvalidArgument, sendFds(pair[0], &.{}));
+    const too_many = [_]fd_t{pair[0]} ** (max_passed_fds + 1);
+    try std.testing.expectError(error.InvalidArgument, sendFds(pair[0], &too_many));
 }

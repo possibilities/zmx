@@ -39,6 +39,7 @@ pub fn assertLabel(key: []const u8, value: []const u8) LabelError!void {
 
 pub fn labelsToU8(alloc: std.mem.Allocator, labels: std.StringHashMapUnmanaged([]u8)) ![]u8 {
     var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(alloc);
     var keys = std.ArrayList([]const u8).empty;
     defer keys.deinit(alloc);
 

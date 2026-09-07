@@ -209,7 +209,7 @@ pub fn list(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, opts: Options) !void 
         var record = exit_record.read(gpa, io, dir, name) catch continue;
         defer record.deinit();
         if (!labelsMatch(record.value.labels, opts.where)) continue;
-        try w.print("  name={s}\tstate=exited\tpid={d}\tended={d}\texit_code={d}\tsignal={d}\treason={s}", .{
+        try w.print("  name={s}\tstate=exited\tpid={d}\tended={d}\texit_code={?d}\tsignal={?d}\treason={s}", .{
             record.value.name, record.value.pid, record.value.endedAt, record.value.code, record.value.signal, record.value.reason,
         });
         var kvs = label.LabelIterator.init(record.value.labels);
@@ -294,7 +294,7 @@ pub fn inspect(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, name: []const u8, 
     }
 
     if (record) |r| {
-        try w.print("name={s}\nstate=exited\npid={d}\ncreated={d}\nended={d}\nexit_code={d}\nsignal={d}\nreason={s}\n", .{
+        try w.print("name={s}\nstate=exited\npid={d}\ncreated={d}\nended={d}\nexit_code={?d}\nsignal={?d}\nreason={s}\n", .{
             r.value.name, r.value.pid, r.value.createdAt, r.value.endedAt, r.value.code, r.value.signal, r.value.reason,
         });
         var kvs = label.LabelIterator.init(r.value.labels);

@@ -28,6 +28,8 @@ pub const Tag = enum(u8) {
     RestoreBegin = 21,
     Ready = 22,
     Exit = 23,
+    Migrate = 24,
+    MigrateAck = 25,
     // Upstream tags 19..22 overlap the published Companion v1 contract.
     // Keep that contract stable and assign new operations unused values.
     EnvGet = 26,
@@ -261,11 +263,21 @@ pub fn negotiate(hello: Hello) Welcome {
 /// closes their sockets. `code` and `signal` are what `waitpid` reported --
 /// a signalled child has a non-zero `signal` and a `code` of 0 -- while
 /// `reason` says what brought it about. On the wire: code u8, signal u8,
-/// reason u8, then five reserved zero bytes.
+/// reason u8, flags u8, then four reserved zero bytes.
 pub const Exit = struct {
     code: u8 = 0,
     signal: u8 = 0,
     reason: Reason = .natural,
+    /// Whether `code` and `signal` mean anything. A daemon that adopted its
+    /// child in a handoff is not that child's parent and cannot wait for it,
+    /// so it can see that the child ended without learning how. The reason
+    /// stays true either way: an adopted child that ends on its own still
+    /// ended naturally.
+    ///
+    /// Carried as the low bit of the flags byte, set when the status is
+    /// *un*known, so the zero a daemon that predates handoffs writes there
+    /// still reads as the status it really had.
+    status_known: bool = true,
 
     /// Kept as explicit integers: these cross the socket.
     pub const Reason = enum(u8) {
@@ -283,11 +295,16 @@ pub const Exit = struct {
 
 pub const exit_len = 8;
 
+/// The flags byte's low bit: the sender could not observe how the child
+/// ended, so `code` and `signal` are zero because nothing filled them.
+pub const exit_status_unknown: u8 = 1 << 0;
+
 pub fn encodeExit(status: Exit) [exit_len]u8 {
     var out = [_]u8{0} ** exit_len;
     out[0] = status.code;
     out[1] = status.signal;
     out[2] = @intFromEnum(status.reason);
+    out[3] = if (status.status_known) 0 else exit_status_unknown;
     return out;
 }
 
@@ -297,6 +314,7 @@ pub fn decodeExit(bytes: []const u8) error{BadLength}!Exit {
         .code = bytes[0],
         .signal = bytes[1],
         .reason = @enumFromInt(bytes[2]),
+        .status_known = bytes[3] & exit_status_unknown == 0,
     };
 }
 
@@ -697,7 +715,8 @@ test "Tag wire values are frozen" {
         .{ Tag.LabelSet, 15 },     .{ Tag.LabelClear, 16 },   .{ Tag.LabelData, 17 },
         .{ Tag.Send, 18 },         .{ Tag.Hello, 19 },        .{ Tag.Welcome, 20 },
         .{ Tag.RestoreBegin, 21 }, .{ Tag.Ready, 22 },        .{ Tag.Exit, 23 },
-        .{ Tag.EnvGet, 26 }, .{ Tag.EnvSet, 27 }, .{ Tag.EnvData, 28 }, .{ Tag.Capture, 29 },
+        .{ Tag.Migrate, 24 },      .{ Tag.MigrateAck, 25 },   .{ Tag.EnvGet, 26 },
+        .{ Tag.EnvSet, 27 },       .{ Tag.EnvData, 28 },      .{ Tag.Capture, 29 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
 }
 
@@ -728,6 +747,24 @@ test "Exit wire bytes are frozen" {
     const future = try decodeExit(&.{ 0, 0, 200, 0, 0, 0, 0, 0 });
     try std.testing.expectEqual(@as(u8, 200), @intFromEnum(future.reason));
     try std.testing.expectError(error.BadLength, decodeExit(&.{ 0, 0, 0 }));
+}
+
+test "an unknown child status is a flag, not a code" {
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 0, 0, 0, 1, 0, 0, 0, 0 },
+        &encodeExit(.{ .status_known = false }),
+    );
+    const unknown = try decodeExit(&.{ 0, 0, 0, 1, 0, 0, 0, 0 });
+    try std.testing.expect(!unknown.status_known);
+    // Every frame a daemon that predates handoffs ever wrote left the flags
+    // byte zero, and every one of those really did carry a status.
+    const legacy = try decodeExit(&.{ 7, 0, 0, 0, 0, 0, 0, 0 });
+    try std.testing.expect(legacy.status_known);
+    try std.testing.expectEqual(@as(u8, 7), legacy.code);
+    // Bits this build does not define are ignored rather than misread.
+    const future_flags = try decodeExit(&.{ 7, 0, 0, 0b1111_0000, 0, 0, 0, 0 });
+    try std.testing.expect(future_flags.status_known);
 }
 
 test "wait status splits into code or signal" {
