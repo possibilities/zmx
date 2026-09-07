@@ -18,22 +18,20 @@ pub fn build(b: *std.Build) void {
     const version = b.option([]const u8, "version", "Version string for release") orelse
         @as([]const u8, build_zig_zon.version);
 
-    // Built as fmx's Companion, zmx keeps its sessions in fmx's directory by
-    // default (/tmp/fmx-<uid>/zmx, logs under it) rather than in the one a
-    // stock zmx on the same machine uses, so a bare `fmx-zmx list` by hand
-    // finds fmx's sessions and never lists or sweeps a human's own.
+    // Companion builds use a private directory separate from stock zmx.
+    // The legacy default path is stable; consumers can select their own
+    // session directory with ZMX_DIR.
     const companion = b.option(
         bool,
         "companion",
-        "Build as fmx's Companion: the default directory is /tmp/fmx-<uid>/zmx",
+        "Build as a Companion: the private default directory is /tmp/fmx-<uid>/zmx",
     ) orelse false;
 
-    // A build string naming fmx (`<version>+fmx.<commit>`) is what fmx
-    // pins, and fmx trusts it to mean a Companion build; one without
-    // -Dcompanion would pass the pin and then keep a human's by-hand
-    // sessions in the stock directory. Refuse to build it.
-    const refused: ?*std.Build.Step.Fail = if (!companion and std.mem.indexOf(u8, version, "+fmx.") != null)
-        b.addFail("a version naming fmx (+fmx.) needs -Dcompanion")
+    // Published fork builds identify their owner, independently of consumers.
+    // A pinned build must also use the isolated Companion directory policy;
+    // otherwise it could pass a consumer's pin but touch stock sessions.
+    const refused: ?*std.Build.Step.Fail = if (!companion and std.mem.indexOf(u8, version, "+arthack.") != null)
+        b.addFail("an arthack fork version (+arthack.) needs -Dcompanion")
     else
         null;
 
